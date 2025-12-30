@@ -10,7 +10,7 @@
 > **December 30, 2024 Update - Nested Header Semantics:**
 > - Block 3 Region 4 is a **cross-block reference** to Block 4 (declared size = Block 4's compressed size)
 > - Block 5 Region 2 contains **pre-allocated growth space** (+2,049 bytes beyond declared)
-> - Inter-region gaps follow consistent 5-byte format: `[type] [value_16 LE] [terminator 0x2000]`
+> - Inter-region gaps: Block 3 uses 5-byte format `[type][value_16 LE][20 00]`, Block 5 uses 4-byte format `[00][value_8][20 00]`
 
 ## Overview
 
@@ -63,9 +63,26 @@ Block 3 contains **4 nested headers** with distinct data regions:
 - **Region 1**: Heavy TABLE_REF usage (72 of 80 total), 62 PREFIX_1C04, core CompactType_5E objects
 - **Region 2**: PhysicalInventoryItem refs + type metadata, type hash 0xA1A85298, 17 PREFIX_173C
 - **Region 3**: Numeric counters, game statistics (29.8% VARINT, 25% FIXED32)
-- **Region 4**: **Cross-block pointer to Block 4** - only 5 bytes of actual data
+- **Region 4**: **Cross-block size reference to Block 4** - only 5 bytes of local data
 
-**CRITICAL:** Region 4's declared size (2,150 bytes) **exactly matches Block 4's LZSS compressed size**. The region contains only 5 bytes (`00 27 a6 62 20`) and serves as a **cross-block reference descriptor** pointing to Block 4 inventory data.
+**CRITICAL - Region 4 Cross-Block Relationship (CONFIRMED):**
+
+Region 4 is physically located inside Block 3, but its header declares a size that references Block 4:
+
+| Property | Value |
+|----------|-------|
+| Region 4 location | Block 3 offset 0x1F17 (header) / 0x1F1F (data) |
+| Header declared size | 2,150 bytes |
+| Region 4 actual data | 5 bytes: `00 27 a6 62 20` |
+| Block 4 compressed size | 2,150 bytes (EXACT MATCH) |
+
+**Mechanism:** The declared size in Region 4's header (2,150 bytes) tells the game engine how much LZSS-compressed data to read from Block 4. The 5-byte local content (`00 27 a6 62 20`) is inventory metadata/descriptor. This establishes Block 4 as the "data payload" for Region 4, creating a structural link between Block 3 (compact format metadata) and Block 4 (LZSS-compressed inventory items).
+
+**Why this is NOT coincidental:**
+- 2,150 is not a round number (0x866 hex)
+- Block 4 has no header - its size must be determined externally
+- Region 4 is positioned immediately before Block 4 in the file
+- The relationship is: Region 4 "owns" Block 4's inventory data
 
 **File Size Verification:**
 - 4 headers: 4 x 8 = 32 bytes
@@ -81,7 +98,7 @@ Block 5 contains **2 nested headers** (simpler than Block 3):
 |--------|--------|----------|--------|---------|
 | Header 1 | 0x0000 | 8 | 8 | Version 0x01, size 1,879, flags 0x00800000 |
 | Region 1 | 0x0008 | 1,879 | 1,879 | PropertyReference root bindings |
-| Gap | 0x0760 | 5 | 5 | Inter-region separator (`00 e5 20 00 01`) |
+| Gap | 0x0760-0x0763 | 4 | 4 | Inter-region separator (`00 e5 20 00`) |
 | Header 2 | 0x0764 | 8 | 8 | Version 0x01, size 2,317, flags 0x00800000 |
 | Region 2 | 0x076C | 2,317 | 4,366 | Extended data + growth buffer |
 
@@ -193,7 +210,7 @@ Growth buffer --------> Dynamic additions during gameplay
 | Header validity | Both valid (0x01) | All 4 valid (0x01) |
 | TABLE_REF distribution | Symmetric (5 each) | Concentrated in Region 1 (72 of 80) |
 | Growth buffer | Yes (Region 2) | No (Region 4 is cross-block ref) |
-| Inter-region gaps | 1 gap (5 bytes) | 3 gaps (5 bytes each) |
+| Inter-region gaps | 1 gap (4 bytes) | 3 gaps (5 bytes each) |
 | Total size | 6,266 bytes | 7,972 bytes |
 
 ### Size Field Semantics
@@ -205,12 +222,12 @@ Growth buffer --------> Dynamic additions during gameplay
 - **Block 5 Region 1**: Declared size matches actual data size
 - **Block 5 Region 2**: +2,049 byte excess beyond declared = **pre-allocated growth buffer**
 
-### 5-Byte Inter-Region Gap Structure
+### Inter-Region Gap Structure
 
-All gaps between regions follow a consistent 5-byte format:
+**Block 3** uses a consistent **5-byte** gap format:
 
 ```
-[type_byte] [value_16 LE] [terminator_16 = 0x0020]
+[type_byte] [value_16 LE] [terminator_16 = 0x20 0x00]
 ```
 
 | Gap | Bytes | Type | Value (decimal) |
@@ -218,7 +235,16 @@ All gaps between regions follow a consistent 5-byte format:
 | Block 3: 1->2 | `04 74 62 20 00` | 0x04 | 25,204 |
 | Block 3: 2->3 | `00 00 28 20 00` | 0x00 | 10,240 |
 | Block 3: 3->4 | `00 00 a7 20 00` | 0x00 | 42,752 |
-| Block 5: 1->2 | `00 00 e5 20 00` | 0x00 | 58,624 |
+
+**Block 5** uses a shorter **4-byte** gap format:
+
+```
+[00] [value_8] [terminator_16 = 0x20 0x00]
+```
+
+| Gap | Bytes | Format |
+|-----|-------|--------|
+| Block 5: 1->2 | `00 e5 20 00` | 4 bytes (no 16-bit value field) |
 
 The terminator `20 00` is the same as the LZSS stream terminator.
 
@@ -261,7 +287,7 @@ Block 5 (6,266 bytes):
 | Region 1 (0x0008-0x075F): PropertyReference Data   |
 |   5 TABLE_REFs, PropertyReference hash             |
 +-----------------------------------------+----------+
-| Gap (0x0760-0x0763): 00 00 e5 20 00             5b |
+| Gap (0x0760-0x0763): 00 e5 20 00                4b |
 +-----------------------------------------+----------+
 | Header 2 (0x0764-0x076B): 01 0D 09 00 00 00 80 00  |
 +----------------------------------------------------+
@@ -875,45 +901,21 @@ Based on structural analysis:
 | Structure | Single header | Multiple nested headers |
 | TABLE_REF usage | N/A (uses type hashes) | Heavy (Block 3) / Light (Block 5) |
 
-## TYPE_REF Format (FUN_01af6a40)
+## Note: TYPE_REF Dispatcher (Full Format Only)
 
-The TYPE_REF dispatcher at `FUN_01af6a40` (offset `+0x16f6a40`) handles type references using a prefix byte:
-
-### Prefix Byte Dispatch
-
-| Prefix | Format | Description |
-|--------|--------|-------------|
-| `0x00` | Full object | Nested deserialization with full object data |
-| `0x01` | Type reference | Validation + sub-type byte + 4-byte type hash |
-| `>= 0x02` | Simple reference | Direct object lookup by reference ID |
-
-### Type Reference Structure (Prefix 0x01)
-
-```
-01 [sub_type] [type_hash: 4 bytes LE]
-
-Example: 01 05 5E 41 98 0D
-         |  |  |
-         |  |  +-- Type hash: 0x0D98415E
-         |  +-- Sub-type byte
-         +-- Prefix: type reference
-```
-
-### Full Object Structure (Prefix 0x00)
-
-```
-00 [object_data...]
-
-The object data is recursively deserialized using the same pipeline.
-```
-
-### Simple Reference Structure (Prefix >= 0x02)
-
-```
-[ref_id]
-
-Where ref_id >= 2. The object is looked up from a reference table.
-```
+> **IMPORTANT CLARIFICATION:** The function `FUN_01af6a40` (TYPE_REF dispatcher) is used
+> exclusively by the **full format** (Blocks 1, 2, 4), **NOT** by the compact format
+> described in this document.
+>
+> The TYPE_REF dispatcher:
+> 1. Reads a prefix byte (0x00, 0x01, or >= 0x02)
+> 2. All code paths call `FUN_01aeb020` which takes **4-byte TYPE HASHES**
+>
+> The compact format (Blocks 3, 5) uses a completely different mechanism:
+> - **Judy arrays** with nibble-encoded table IDs via `FUN_01AEAF70`
+> - **TABLE_REF** patterns (`08 03 [table_id] [prop_id]`)
+>
+> See `docs/TYPE_SYSTEM_REFERENCE.md` for details on the full format TYPE_REF dispatcher.
 
 ## Implementation Notes
 
@@ -969,7 +971,7 @@ The compact format is NOT protobuf-style encoding. It's **serialized Judy array 
 4. **Output types 0x08-0x1C** are canonical serialized node types
 5. **Call chain** goes through FUN_01AEAF70 (table ID lookup) → encoder
 6. **Nested headers** - Block 3 has 4 valid headers, Block 5 has 2 valid headers
-7. **Inter-region gaps** - 5-byte separators with `[type][value_16 LE][20 00]` format
+7. **Inter-region gaps** - Block 3: 5-byte format, Block 5: 4-byte format (both end with `20 00` terminator)
 8. **All headers valid** - Both blocks use version 0x01, flags 0x00800000
 
 ### Remaining Tasks

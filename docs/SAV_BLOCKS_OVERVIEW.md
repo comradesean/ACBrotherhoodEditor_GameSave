@@ -243,10 +243,10 @@ All gaps between regions use 5-byte format: `[type] [value_16 LE] [0x20 0x00]`
 
 | Topic | Document |
 |-------|----------|
-| SaveGame root structure | [BLOCK1_SAVEGAME_STRUCTURE.md](BLOCK1_SAVEGAME_STRUCTURE.md) |
-| Game state and missions | [BLOCK2_GAME_STATE_STRUCTURE.md](BLOCK2_GAME_STATE_STRUCTURE.md) |
-| Inventory items | [BLOCK4_INVENTORY_STRUCTURE.md](BLOCK4_INVENTORY_STRUCTURE.md) |
-| Compact format spec | [BLOCKS_3_5_COMPACT_FORMAT.md](BLOCKS_3_5_COMPACT_FORMAT.md) |
+| SaveGame root structure | [BLOCK1_SAVEGAME_STRUCTURE.md](blocks/BLOCK1_SAVEGAME_STRUCTURE.md) |
+| Game state and missions | [BLOCK2_GAME_STATE_STRUCTURE.md](blocks/BLOCK2_GAME_STATE_STRUCTURE.md) |
+| Inventory items | [BLOCK4_INVENTORY_STRUCTURE.md](blocks/BLOCK4_INVENTORY_STRUCTURE.md) |
+| Compact format spec | [BLOCKS_3_5_COMPACT_FORMAT.md](blocks/BLOCKS_3_5_COMPACT_FORMAT.md) |
 | Complete SAV specification | [SAV_FILE_FORMAT_SPECIFICATION.md](SAV_FILE_FORMAT_SPECIFICATION.md) |
 | Type system reference | [TYPE_SYSTEM_REFERENCE.md](TYPE_SYSTEM_REFERENCE.md) |
 

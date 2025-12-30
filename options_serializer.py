@@ -8,7 +8,7 @@ with proper headers, LZSS compression, and Adler-32 checksums.
 
 The OPTIONS file structure:
 
-Section 1 (40-byte header):
+Section 1 (44-byte header):
   1. Section ID (16 bytes, all static)
   2. Common pattern (16 bytes): 33 AA FB 57 99 FA 04 10 01 00 02 00 80 00 00 01
   3. Compressed length (4 bytes, little-endian)

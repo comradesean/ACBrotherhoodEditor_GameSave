@@ -113,8 +113,9 @@ CommonParent (0x7E42F87F) - ROOT (0 properties, 786 code refs)
 | Hash | Name | Refs | Parent | Size | Table ID |
 |------|------|------|--------|------|----------|
 | `0xBDBE3B52` | SaveGame | 1 | ManagedObject | ~80 bytes | - |
+| `0x94D6F8F1` | AssassinSaveGameData | 1 | - | 32 KB | - |
 | `0x5FDACBA0` | SaveGameDataObject | 5 | ManagedObject | Variable | - |
-| `0x5ED7B213` | MissionSaveData | 1 | - | Variable | - |
+| `0x5ED7B213` | MissionSaveData | 3 | - | Variable | - |
 | `0x12DE6C4C` | RewardFault | 2 | - | ~16 bytes | - |
 
 ### World Types
@@ -122,6 +123,20 @@ CommonParent (0x7E42F87F) - ROOT (0 properties, 786 code refs)
 | Hash | Name | Refs | Parent | Size | Table ID |
 |------|------|------|--------|------|----------|
 | `0xFBB63E47` | World | 88 | ManagedObject | >848 bytes | 0x20 |
+
+### Inventory Types
+
+| Hash | Name | Refs | Parent | Size | Table ID |
+|------|------|------|--------|------|----------|
+| `0xA1A85298` | PhysicalInventoryItem | 364 | - | 22-1236 bytes | - |
+
+### Collectible Types
+
+| Hash | Name | Refs | Parent | Size | Table ID |
+|------|------|------|--------|------|----------|
+| `0x9BD7FCBE` | CollectibleRecord | 157 | - | ~98 bytes | - |
+| `0x75758A0E` | CollectibleClass | 157 | - | 18 bytes | - |
+| `0x768CAE23` | CollectibleParent | 157 | World | 18 bytes | - |
 
 ### Property System Types
 
@@ -156,6 +171,15 @@ CommonParent (0x7E42F87F) - ROOT (0 properties, 786 code refs)
 | `0x7879288E` | PlayerOptionsSaveData | 5 | - | 76 bytes | - |
 | `0x2DAD13E3` | PlayerOptionsElement | 20 | AbstractElementBase | 48 bytes | 22 |
 | `0xE9DDD041` | AbstractElementBase | 0 | CommonParent | - (abstract) | - |
+
+### Compact Format Types (Blocks 3 & 5)
+
+| Hash | Name | Refs | Parent | Size | Table ID |
+|------|------|------|--------|------|----------|
+| `0x0DEBED19` | CompactType_5E | 63 | CommonParent | 22 props | 0x5E |
+| `0xC8761736` | CompactType_5B | 4 | CommonParent | 22 props | 0x5B |
+| `0xF49BFD86` | CompactType_4F | 61 | CommonParent | 22 props | 0x4F |
+| `0xFC6EDE2A` | CompactType_3B | 1 | CommonParent | 22 props | 0x3B |
 
 ---
 

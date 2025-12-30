@@ -247,17 +247,44 @@ Context around the reference:
 
 ## Property Hash Reference
 
-| Hash | Possible Purpose |
-|------|------------------|
-| 0x70A1EA5F | Unknown uint32 property |
-| 0x2578300E | Unknown (contains 0x00FEDBAC) |
-| 0xF5C71F6B | Unknown uint32 |
-| 0xBB6621D2 | Unknown uint32 |
-| 0x28550876 | Unknown uint32 |
-| 0x34032BE4 | Embedded object type |
-| 0x78BD5067 | Player name (string) |
-| 0x7111FCC2 | World reference |
-| 0x6C448E95 | SaveGameDataObject reference |
-| 0xEB76C432 | Unknown uint32 |
-| 0x28F5132B | Unknown uint32 |
-| 0x8C00191B | Unknown uint32 (timestamp?) |
+### Resolved Properties (December 2024)
+
+Hash algorithm confirmed as **CRC32 (zlib.crc32)**. Only 2 of 12 SaveGame properties resolved via string extraction:
+
+| Hash | Field Name | Type | Value | Verified |
+|------|-----------|------|-------|----------|
+| `0x70A1EA5F` | **Version** | uint32 | 22 | CRC32("Version") |
+| `0x78BD5067` | **PlayerName** | string | "Desmond" | CRC32("PlayerName") |
+
+### Unmapped Properties (10 of 12)
+
+Property names are stripped at compile time and cannot be resolved via string matching:
+
+| Hash | Type | Value | Notes |
+|------|------|-------|-------|
+| `0x2578300E` | uint32 | 0x00FEDBAC | Magic number pattern |
+| `0x28550876` | uint32 | 0 | Zero value |
+| `0x28F5132B` | uint32 | 0 | Zero value |
+| `0x34032BE4` | embedded | 14 | Embedded object type hash |
+| `0x6C448E95` | object_ref | 0x00000000 | SaveGameDataObject (null ref) |
+| `0x7111FCC2` | object_ref | 0x8DAC4763 | World reference (cross-block) |
+| `0x8C00191B` | uint32 | 0x64B82027 | Possible timestamp/hash |
+| `0xBB6621D2` | uint32 | 0x00055E0F | Unknown (351759 decimal) |
+| `0xEB76C432` | uint32 | 1 | Boolean/flag value |
+| `0xF5C71F6B` | uint32 | 6 | Small counter/enum |
+
+### Cross-Block References
+
+Two properties link to other blocks:
+
+| Hash | Target | Block | Object ID |
+|------|--------|-------|-----------|
+| `0x7111FCC2` | World | Block 2 | 0x8DAC4763 |
+| `0x6C448E95` | SaveGameDataObject | Block 2 | 0x00000000 (null) |
+
+### Future Resolution
+
+Property names require alternative discovery methods:
+- Type Descriptor Table at Ghidra VA `0x027E0638`
+- Dynamic analysis via Cheat Engine value modification
+- Type lookup function `FUN_01AEAD60`

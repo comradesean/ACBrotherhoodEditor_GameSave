@@ -4,38 +4,45 @@ Assassin's Creed Brotherhood - Compact Format Parser
 =====================================================
 
 Parser for SAV file Blocks 3 and 5 which use a compact binary format
-with table-based type resolution and variable-length encoding.
+with Judy Array node serialization and table-based type resolution.
+
+Key Discovery (December 2024):
+-----------------------------
+The compact format uses **Judy Arrays** for property storage. The 2-byte
+prefixes (0x1500, 0x1809, etc.) are Judy node type markers, not protobuf-style
+wire types. This was confirmed via TTD debugging of FUN_01b25230.
 
 Format Overview:
 ---------------
-- 8-byte header (version, size, flags)
-- Preamble region (initialization data)
-- Data region with prefixed entries
+- 8-byte header per region (version, size, flags)
+- Multiple nested regions in each block
+- 5-byte inter-region gaps ending with 0x2000 terminator
+- Judy array node serialization for property data
 
-Prefix Types:
--------------
-| Prefix | Name       | Description                              |
-|--------|------------|------------------------------------------|
-| 0x0803 | TABLE_REF  | Table ID + Property Index reference      |
-| 0x1405 | VARINT     | Variable-length integer                  |
-| 0x0502 | FIXED32    | 32-bit fixed value                       |
-| 0x1500 | VALUE_15   | 32-bit value (6 bytes total)             |
-| 0x1200 | VALUE_12   | 32-bit value (6 bytes total)             |
-| 0x1C04 | EXTENDED   | Extended value with type discriminator   |
-| 0x173C | ARRAY_ELEM | Compact array/collection element         |
-| 0x1006 | TYPE_REF   | Type reference                           |
-| 0x1809 | PREFIX_18  | Extended marker                          |
+Judy Node Types:
+---------------
+| Type | Encoder | Key Size | Entry Count | Format |
+|------|---------|----------|-------------|--------|
+| 0x14 | FUN_01b24720 | 1 byte | [+4] + 1 | Linear leaf (variable) |
+| 0x15 | FUN_01b249a0 | 3 bytes | [+4] + 1 | Linear leaf |
+| 0x17 | FUN_01b24720 | 2 bytes | bitmap | Bitmap branch (up to 256) |
+| 0x18 | FUN_01b24720 | 2 bytes | 1 | Single entry leaf |
+| 0x19 | FUN_01b249a0 | 3 bytes | 1 | Single 3-byte entry |
+| 0x1b | FUN_01b24720 | 1 byte | 2 | 2-element leaf |
+| 0x1c | FUN_01b24720 | 1 byte | 3 | 3-element leaf |
 
 Usage:
 ------
     python compact_format_parser.py references/sav_block3_raw.bin
     python compact_format_parser.py references/sav_block5_raw.bin --verbose
+    python compact_format_parser.py references/sav_block3_raw.bin --regions --judy
 """
 
 import sys
 import os
 import struct
 import argparse
+import json
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Any, Union
 from enum import Enum, auto
@@ -59,7 +66,26 @@ class PrefixType(Enum):
     PREFIX_1907 = 0x1907    # Unknown prefix
     PREFIX_16E1 = 0x16E1    # Unknown prefix
     PREFIX_0C18 = 0x0C18    # Extended format
+    # Judy node types
+    JUDY_14 = 0x14          # Linear leaf (variable count, 1-byte keys)
+    JUDY_15 = 0x15          # Linear leaf (3-byte keys)
+    JUDY_17 = 0x17          # Bitmap branch
+    JUDY_18 = 0x18          # Single entry leaf (2-byte key)
+    JUDY_19 = 0x19          # Single 3-byte entry
+    JUDY_1B = 0x1B          # 2-element leaf
+    JUDY_1C = 0x1C          # 3-element leaf
     UNKNOWN = 0x0000
+
+
+class JudyNodeType(Enum):
+    """Judy array node types from FUN_01b24720 and FUN_01b249a0"""
+    LINEAR_1BYTE_VAR = 0x14    # Variable count, 1-byte keys
+    LINEAR_3BYTE = 0x15        # Variable count, 3-byte keys
+    BITMAP_2BYTE = 0x17        # Bitmap branch, 2-byte keys
+    SINGLE_2BYTE = 0x18        # Single entry, 2-byte key
+    SINGLE_3BYTE = 0x19        # Single entry, 3-byte key
+    LEAF_2ELEM = 0x1B          # 2-element leaf
+    LEAF_3ELEM = 0x1C          # 3-element leaf
 
 
 # Table ID to Type Hash mapping (104 entries from table_id_hash_simple.json)
@@ -180,6 +206,17 @@ MARKER_TRUE = 0x6D   # Boolean TRUE or value 1
 MARKER_FALSE = 0xDB  # Boolean FALSE or value 0
 MARKER_CD = 0xCD     # Unknown separator/flag
 
+# Known type hashes
+TYPE_HASHES = {
+    0xA1A85298: "PhysicalInventoryItem",
+    0xF7D44F07: "Unknown_F7D44F07",
+    0x0984415E: "PropertyReference",
+    0xFBB63E47: "World",
+    0x2DAD13E3: "PlayerOptionsElement",
+    0xBDBE3B52: "SaveGame",
+    0x5FDACBA0: "SaveGameDataObject",
+}
+
 
 # =============================================================================
 # Data Classes
@@ -192,15 +229,94 @@ class CompactHeader:
     data_size: int      # 3 bytes - little-endian 24-bit
     flags: int          # 4 bytes - always 0x00800000
     raw_bytes: bytes    # Original 8 bytes
+    offset: int = 0     # Offset in file
 
     @classmethod
-    def parse(cls, data: bytes, offset: int = 0) -> 'CompactHeader':
-        """Parse header from data at offset"""
+    def parse(cls, data: bytes, offset: int = 0) -> Optional['CompactHeader']:
+        """Parse header from data at offset. Returns None if invalid."""
+        if offset + 8 > len(data):
+            return None
         raw = data[offset:offset + 8]
         version = raw[0]
         data_size = raw[1] | (raw[2] << 8) | (raw[3] << 16)
         flags = struct.unpack('<I', raw[4:8])[0]
-        return cls(version=version, data_size=data_size, flags=flags, raw_bytes=raw)
+
+        # Validate: version must be 0x01, flags must be 0x00800000
+        if version != 0x01 or flags != 0x00800000:
+            return None
+
+        return cls(version=version, data_size=data_size, flags=flags,
+                   raw_bytes=raw, offset=offset)
+
+    def __str__(self):
+        return f"Header(offset=0x{self.offset:04X}, version={self.version}, size={self.data_size}, flags=0x{self.flags:08X})"
+
+
+@dataclass
+class Region:
+    """A data region within a compact format block"""
+    index: int                  # Region number (1-based)
+    header: CompactHeader       # 8-byte header
+    data_start: int             # Start offset of data (after header)
+    data_end: int               # End offset of data
+    actual_size: int            # Actual data size
+    gap_after: Optional[bytes]  # 5-byte gap after this region (if any)
+    gap_offset: int = 0         # Offset of gap
+    is_cross_block_ref: bool = False  # True if declared size >> actual size
+
+    @property
+    def declared_size(self) -> int:
+        return self.header.data_size
+
+    @property
+    def size_delta(self) -> int:
+        """Difference between actual and declared size"""
+        return self.actual_size - self.declared_size
+
+
+@dataclass
+class InterRegionGap:
+    """5-byte gap between regions"""
+    offset: int
+    type_byte: int
+    value: int          # 16-bit little-endian value
+    terminator: int     # Should be 0x0020 (LZSS terminator)
+    raw_bytes: bytes
+
+    @classmethod
+    def parse(cls, data: bytes, offset: int) -> Optional['InterRegionGap']:
+        """Parse 5-byte gap at offset. Returns None if not a valid gap."""
+        if offset + 5 > len(data):
+            return None
+        raw = data[offset:offset + 5]
+        type_byte = raw[0]
+        value = raw[1] | (raw[2] << 8)
+        terminator = raw[3] | (raw[4] << 8)
+
+        # Terminator must be 0x0020 (stored as 20 00 in LE)
+        if terminator != 0x0020:
+            return None
+
+        return cls(offset=offset, type_byte=type_byte, value=value,
+                   terminator=terminator, raw_bytes=raw)
+
+    def __str__(self):
+        return f"Gap(offset=0x{self.offset:04X}, type=0x{self.type_byte:02X}, value={self.value})"
+
+
+@dataclass
+class JudyNode:
+    """Parsed Judy array node"""
+    offset: int
+    node_type: int          # 0x14-0x1C
+    count: int              # Number of entries
+    keys: List[int]         # Key values (1, 2, or 3 bytes each)
+    values: List[int]       # 4-byte dword values
+    raw_bytes: bytes
+    key_size: int           # 1, 2, or 3 bytes per key
+
+    def __str__(self):
+        return f"JudyNode(type=0x{self.node_type:02X}, count={self.count}, keys={self.keys[:3]}..., values={[hex(v) for v in self.values[:3]]}...)"
 
 
 @dataclass
@@ -252,15 +368,16 @@ class ParsedEntry:
     prefix_type: PrefixType
     data: Any
     size: int  # Total bytes consumed
+    region_index: int = 0  # Which region this entry belongs to
 
 
 @dataclass
 class CompactBlock:
     """Fully parsed compact format block"""
-    header: CompactHeader
-    preamble: bytes
+    regions: List[Region]
     entries: List[ParsedEntry]
     raw_data: bytes
+    judy_nodes: List[JudyNode] = field(default_factory=list)
 
     # Statistics
     table_refs: List[TableRef] = field(default_factory=list)
@@ -268,6 +385,11 @@ class CompactBlock:
     array_elements: List[ArrayElement] = field(default_factory=list)
     fixed_values: List[FixedValue] = field(default_factory=list)
     unknown_regions: List[Tuple[int, int, bytes]] = field(default_factory=list)
+
+    @property
+    def header(self) -> Optional[CompactHeader]:
+        """Return first region's header for compatibility"""
+        return self.regions[0].header if self.regions else None
 
 
 # =============================================================================
@@ -277,8 +399,9 @@ class CompactBlock:
 class CompactFormatParser:
     """Parser for AC Brotherhood compact format blocks"""
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, show_judy: bool = False):
         self.verbose = verbose
+        self.show_judy = show_judy
         self.stats = {
             'table_refs': 0,
             'extended_1c04': 0,
@@ -292,9 +415,108 @@ class CompactFormatParser:
             'prefix_1907': 0,
             'prefix_1902': 0,
             'prefix_16e1': 0,
+            'judy_nodes': 0,
             'unknown': 0,
             'markers': {'0x6D': 0, '0xDB': 0, '0xCD': 0},
         }
+        self.current_region = 0
+
+    def find_region_headers(self, data: bytes) -> List[Tuple[int, CompactHeader]]:
+        """
+        Find all 8-byte headers in the data.
+        Pattern: 01 XX XX XX 00 00 80 00
+
+        Returns list of (offset, header) tuples.
+        """
+        headers = []
+        pos = 0
+        while pos < len(data) - 8:
+            header = CompactHeader.parse(data, pos)
+            if header:
+                headers.append((pos, header))
+                # Skip past header and look for next one
+                # Don't skip the entire declared size since it may not be accurate
+                pos += 8
+            else:
+                pos += 1
+        return headers
+
+    def find_inter_region_gaps(self, data: bytes) -> List[InterRegionGap]:
+        """
+        Find all 5-byte inter-region gaps ending with 20 00 terminator.
+
+        Gap format: [type_byte] [value_16 LE] [20 00]
+        """
+        gaps = []
+        pos = 0
+        while pos < len(data) - 5:
+            gap = InterRegionGap.parse(data, pos)
+            if gap:
+                gaps.append(gap)
+                pos += 5
+            else:
+                pos += 1
+        return gaps
+
+    def detect_regions(self, data: bytes) -> List[Region]:
+        """
+        Detect all regions in the block based on headers and gaps.
+
+        Returns list of Region objects with header info and boundaries.
+        """
+        headers = self.find_region_headers(data)
+        gaps = self.find_inter_region_gaps(data)
+
+        if not headers:
+            return []
+
+        regions = []
+
+        for i, (offset, header) in enumerate(headers):
+            data_start = offset + 8  # Data starts after 8-byte header
+
+            # Find end of this region
+            if i + 1 < len(headers):
+                # Next header exists - find gap before it
+                next_header_offset = headers[i + 1][0]
+                # Look for gap ending at next header
+                gap_after = None
+                gap_offset = 0
+                for gap in gaps:
+                    # Gap should be 5 bytes before next header (with possible header bytes in between)
+                    if gap.offset + 5 <= next_header_offset and gap.offset + 13 >= next_header_offset:
+                        gap_after = gap.raw_bytes
+                        gap_offset = gap.offset
+                        break
+
+                if gap_after:
+                    data_end = gap_offset
+                else:
+                    data_end = next_header_offset
+            else:
+                # Last region - extends to end of file
+                data_end = len(data)
+                gap_after = None
+                gap_offset = 0
+
+            actual_size = data_end - data_start
+
+            # Check for cross-block reference (declared >> actual)
+            is_cross_block_ref = header.data_size > actual_size * 10
+
+            region = Region(
+                index=i + 1,
+                header=header,
+                data_start=data_start,
+                data_end=data_end,
+                actual_size=actual_size,
+                gap_after=gap_after,
+                gap_offset=gap_offset,
+                is_cross_block_ref=is_cross_block_ref
+            )
+            regions.append(region)
+
+        return regions
 
     def parse(self, data: bytes) -> CompactBlock:
         """
@@ -306,43 +528,64 @@ class CompactFormatParser:
         Returns:
             CompactBlock with all parsed entries
         """
-        # Parse header
-        header = CompactHeader.parse(data, 0)
+        # Detect all regions
+        regions = self.detect_regions(data)
 
         if self.verbose:
-            print(f"Header: version={header.version}, size={header.data_size}, flags=0x{header.flags:08X}")
+            print(f"Detected {len(regions)} regions")
+            for region in regions:
+                print(f"  {region.header}")
+                print(f"    Data: 0x{region.data_start:04X} - 0x{region.data_end:04X} ({region.actual_size} bytes)")
+                if region.is_cross_block_ref:
+                    print(f"    ** CROSS-BLOCK REFERENCE ** (declared={region.declared_size}, actual={region.actual_size})")
 
-        # Find first TABLE_REF to determine preamble end
-        preamble_end = self._find_first_table_ref(data)
-        preamble = data[8:preamble_end]
+        # Parse entries from each region
+        all_entries = []
+        judy_nodes = []
 
-        if self.verbose:
-            print(f"Preamble: {preamble_end - 8} bytes (0x08 to 0x{preamble_end:04X})")
+        for region in regions:
+            self.current_region = region.index
 
-        # Parse data region
-        entries = []
-        pos = preamble_end
+            if region.is_cross_block_ref:
+                # Don't try to parse cross-block reference regions
+                if self.verbose:
+                    print(f"\nSkipping Region {region.index} (cross-block reference)")
+                continue
 
-        while pos < len(data) - 1:
-            entry, consumed = self._parse_entry(data, pos)
-            if entry:
-                entries.append(entry)
-                pos += consumed
-            else:
-                # Skip unknown byte
-                pos += 1
-                self.stats['unknown'] += 1
+            pos = region.data_start
+
+            while pos < region.data_end - 1:
+                # Try to parse Judy node first
+                judy_node, consumed = self._parse_judy_node(data, pos)
+                if judy_node:
+                    judy_nodes.append(judy_node)
+                    self.stats['judy_nodes'] += 1
+                    if self.show_judy:
+                        print(f"  0x{pos:04X}: {judy_node}")
+                    pos += consumed
+                    continue
+
+                # Fall back to entry parsing
+                entry, consumed = self._parse_entry(data, pos)
+                if entry:
+                    entry.region_index = region.index
+                    all_entries.append(entry)
+                    pos += consumed
+                else:
+                    # Skip unknown byte
+                    pos += 1
+                    self.stats['unknown'] += 1
 
         # Build result
         block = CompactBlock(
-            header=header,
-            preamble=preamble,
-            entries=entries,
-            raw_data=data
+            regions=regions,
+            entries=all_entries,
+            raw_data=data,
+            judy_nodes=judy_nodes
         )
 
         # Categorize entries
-        for entry in entries:
+        for entry in all_entries:
             if entry.prefix_type == PrefixType.TABLE_REF:
                 block.table_refs.append(entry.data)
             elif entry.prefix_type == PrefixType.EXTENDED_1C:
@@ -353,6 +596,302 @@ class CompactFormatParser:
                 block.fixed_values.append(entry.data)
 
         return block
+
+    def _parse_judy_node(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Try to parse a Judy array node at the given position.
+
+        Judy nodes have format: [type_byte] [count/flags] [keys...] [values...]
+
+        Returns (JudyNode, bytes_consumed) or (None, 0) if not a Judy node.
+        """
+        if pos >= len(data) - 1:
+            return None, 0
+
+        type_byte = data[pos]
+
+        # Type 0x14: Linear leaf with variable count, 1-byte keys
+        if type_byte == 0x14:
+            return self._parse_judy_type_14(data, pos)
+
+        # Type 0x15: Linear leaf with 3-byte keys
+        if type_byte == 0x15:
+            return self._parse_judy_type_15(data, pos)
+
+        # Type 0x17: Bitmap branch with 2-byte keys
+        if type_byte == 0x17:
+            return self._parse_judy_type_17(data, pos)
+
+        # Type 0x18: Single entry leaf with 2-byte key
+        if type_byte == 0x18:
+            return self._parse_judy_type_18(data, pos)
+
+        # Type 0x19: Single 3-byte entry
+        if type_byte == 0x19:
+            return self._parse_judy_type_19(data, pos)
+
+        # Type 0x1B: 2-element leaf with 1-byte keys
+        if type_byte == 0x1B:
+            return self._parse_judy_type_1b(data, pos)
+
+        # Type 0x1C: 3-element leaf with 1-byte keys
+        if type_byte == 0x1C:
+            return self._parse_judy_type_1c(data, pos)
+
+        return None, 0
+
+    def _parse_judy_type_14(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Parse type 0x14: Linear leaf with variable count, 1-byte keys
+        Format: 14 [count-1] [key0] [key1]... [val0_4bytes] [val1_4bytes]...
+
+        Note: The second byte encodes count-1, so actual count = byte + 1
+        """
+        if pos + 2 > len(data):
+            return None, 0
+
+        count_minus_1 = data[pos + 1]
+        count = count_minus_1 + 1
+
+        # Calculate expected size: 2 (header) + count*1 (keys) + count*4 (values)
+        expected_size = 2 + count + count * 4
+        if pos + expected_size > len(data):
+            return None, 0
+
+        keys = []
+        values = []
+        offset = pos + 2
+
+        # Read 1-byte keys
+        for i in range(count):
+            keys.append(data[offset + i])
+        offset += count
+
+        # Read 4-byte values
+        for i in range(count):
+            val = struct.unpack('<I', data[offset:offset + 4])[0]
+            values.append(val)
+            offset += 4
+
+        consumed = offset - pos
+        raw = data[pos:pos + consumed]
+
+        return JudyNode(
+            offset=pos,
+            node_type=0x14,
+            count=count,
+            keys=keys,
+            values=values,
+            raw_bytes=raw,
+            key_size=1
+        ), consumed
+
+    def _parse_judy_type_15(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Parse type 0x15: Linear leaf with 3-byte keys
+        Format: 15 [count-1] [key0_3bytes] [key1_3bytes]... [val0_4bytes] [val1_4bytes]...
+        """
+        if pos + 2 > len(data):
+            return None, 0
+
+        count_minus_1 = data[pos + 1]
+        count = count_minus_1 + 1
+
+        # Calculate expected size: 2 (header) + count*3 (keys) + count*4 (values)
+        expected_size = 2 + count * 3 + count * 4
+        if pos + expected_size > len(data):
+            return None, 0
+
+        keys = []
+        values = []
+        offset = pos + 2
+
+        # Read 3-byte keys (little-endian)
+        for i in range(count):
+            key = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16)
+            keys.append(key)
+            offset += 3
+
+        # Read 4-byte values
+        for i in range(count):
+            val = struct.unpack('<I', data[offset:offset + 4])[0]
+            values.append(val)
+            offset += 4
+
+        consumed = offset - pos
+        raw = data[pos:pos + consumed]
+
+        return JudyNode(
+            offset=pos,
+            node_type=0x15,
+            count=count,
+            keys=keys,
+            values=values,
+            raw_bytes=raw,
+            key_size=3
+        ), consumed
+
+    def _parse_judy_type_17(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Parse type 0x17: Bitmap branch with 2-byte keys
+        Format: 17 [bitmap_byte] [keys...] [values...]
+
+        The bitmap byte indicates which entries are present.
+        This is a more complex format - for now we'll parse a simpler variant.
+        """
+        if pos + 3 > len(data):
+            return None, 0
+
+        # Second byte contains info about the structure
+        info_byte = data[pos + 1]
+
+        # Simple heuristic: treat as having few elements
+        # The real format uses population count on bitmap
+        count = min(info_byte & 0x0F, 8) if info_byte else 1
+        if count == 0:
+            count = 1
+
+        # Calculate expected size: 2 (header) + count*2 (keys) + count*4 (values)
+        expected_size = 2 + count * 2 + count * 4
+        if pos + expected_size > len(data):
+            return None, 0
+
+        keys = []
+        values = []
+        offset = pos + 2
+
+        # Read 2-byte keys
+        for i in range(count):
+            key = data[offset] | (data[offset + 1] << 8)
+            keys.append(key)
+            offset += 2
+
+        # Read 4-byte values
+        for i in range(count):
+            val = struct.unpack('<I', data[offset:offset + 4])[0]
+            values.append(val)
+            offset += 4
+
+        consumed = offset - pos
+        raw = data[pos:pos + consumed]
+
+        return JudyNode(
+            offset=pos,
+            node_type=0x17,
+            count=count,
+            keys=keys,
+            values=values,
+            raw_bytes=raw,
+            key_size=2
+        ), consumed
+
+    def _parse_judy_type_18(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Parse type 0x18: Single entry leaf with 2-byte key
+        Format: 18 [key_high] [key_low] (implicitly 0) [value_4bytes]
+
+        Actually the format seems to be: 18 [key_byte] [value_4bytes]
+        Where key is the second byte directly.
+        """
+        if pos + 6 > len(data):
+            return None, 0
+
+        # Key is in the second byte (with possible extension)
+        key = data[pos + 1]
+
+        # Value starts at offset 2
+        val = struct.unpack('<I', data[pos + 2:pos + 6])[0]
+
+        return JudyNode(
+            offset=pos,
+            node_type=0x18,
+            count=1,
+            keys=[key],
+            values=[val],
+            raw_bytes=data[pos:pos + 6],
+            key_size=2
+        ), 6
+
+    def _parse_judy_type_19(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Parse type 0x19: Single 3-byte entry
+        Format: 19 [key_byte2] [key_byte1] [key_byte0] [value_4bytes]
+
+        Total: 8 bytes (1 type + 3 key + 4 value)
+        """
+        if pos + 8 > len(data):
+            return None, 0
+
+        # 3-byte key (little-endian)
+        key = data[pos + 1] | (data[pos + 2] << 8) | (data[pos + 3] << 16)
+
+        # 4-byte value
+        val = struct.unpack('<I', data[pos + 4:pos + 8])[0]
+
+        return JudyNode(
+            offset=pos,
+            node_type=0x19,
+            count=1,
+            keys=[key],
+            values=[val],
+            raw_bytes=data[pos:pos + 8],
+            key_size=3
+        ), 8
+
+    def _parse_judy_type_1b(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Parse type 0x1B: 2-element leaf with 1-byte keys
+        Format: 1B [flags] [key0] [key1] [val0_4bytes] [val1_4bytes]
+
+        Total: 2 + 2 + 8 = 12 bytes
+        """
+        if pos + 12 > len(data):
+            return None, 0
+
+        flags = data[pos + 1]
+        keys = [data[pos + 2], data[pos + 3]]
+        values = [
+            struct.unpack('<I', data[pos + 4:pos + 8])[0],
+            struct.unpack('<I', data[pos + 8:pos + 12])[0]
+        ]
+
+        return JudyNode(
+            offset=pos,
+            node_type=0x1B,
+            count=2,
+            keys=keys,
+            values=values,
+            raw_bytes=data[pos:pos + 12],
+            key_size=1
+        ), 12
+
+    def _parse_judy_type_1c(self, data: bytes, pos: int) -> Tuple[Optional[JudyNode], int]:
+        """
+        Parse type 0x1C: 3-element leaf with 1-byte keys
+        Format: 1C [flags] [key0] [key1] [key2] [val0_4bytes] [val1_4bytes] [val2_4bytes]
+
+        Total: 2 + 3 + 12 = 17 bytes
+        """
+        if pos + 17 > len(data):
+            return None, 0
+
+        flags = data[pos + 1]
+        keys = [data[pos + 2], data[pos + 3], data[pos + 4]]
+        values = [
+            struct.unpack('<I', data[pos + 5:pos + 9])[0],
+            struct.unpack('<I', data[pos + 9:pos + 13])[0],
+            struct.unpack('<I', data[pos + 13:pos + 17])[0]
+        ]
+
+        return JudyNode(
+            offset=pos,
+            node_type=0x1C,
+            count=3,
+            keys=keys,
+            values=values,
+            raw_bytes=data[pos:pos + 17],
+            key_size=1
+        ), 17
 
     def _find_first_table_ref(self, data: bytes) -> int:
         """Find offset of first TABLE_REF (0x0803) pattern"""
@@ -403,7 +942,7 @@ class CompactFormatParser:
         if b0 == 0x14 and b1 == 0x05:
             return self._parse_varint(data, pos)
 
-        # TYPE_REF: 10 06 [type ref...]
+        # TYPE_REF: 10 06 [table_id] [data...]
         if b0 == 0x10 and b1 == 0x06:
             return self._parse_type_ref(data, pos)
 
@@ -848,6 +1387,7 @@ class CompactFormatParser:
         print(f"  PREFIX_1907:            {self.stats['prefix_1907']:4d}")
         print(f"  PREFIX_1902:            {self.stats['prefix_1902']:4d}")
         print(f"  PREFIX_16E1:            {self.stats['prefix_16e1']:4d}")
+        print(f"  Judy nodes:             {self.stats['judy_nodes']:4d}")
         print(f"  Unknown bytes:          {self.stats['unknown']:4d}")
         print()
         print("  Markers:")
@@ -859,6 +1399,68 @@ class CompactFormatParser:
 # =============================================================================
 # Analysis Functions
 # =============================================================================
+
+def analyze_regions(block: CompactBlock):
+    """Analyze region structure"""
+    print("\n" + "=" * 60)
+    print("REGION ANALYSIS")
+    print("=" * 60)
+
+    print(f"\nTotal regions: {len(block.regions)}")
+
+    for region in block.regions:
+        print(f"\n--- Region {region.index} ---")
+        print(f"  Header offset:  0x{region.header.offset:04X}")
+        print(f"  Data range:     0x{region.data_start:04X} - 0x{region.data_end:04X}")
+        print(f"  Declared size:  {region.declared_size:,} bytes")
+        print(f"  Actual size:    {region.actual_size:,} bytes")
+        print(f"  Size delta:     {region.size_delta:+d} bytes")
+
+        if region.is_cross_block_ref:
+            print(f"  ** CROSS-BLOCK REFERENCE **")
+            print(f"     Declared size likely refers to external block data")
+
+        if region.gap_after:
+            gap = InterRegionGap.parse(block.raw_data, region.gap_offset)
+            if gap:
+                print(f"  Gap after:      {gap}")
+                print(f"     Raw bytes:   {gap.raw_bytes.hex()}")
+
+
+def analyze_judy_nodes(block: CompactBlock):
+    """Analyze Judy array nodes"""
+    print("\n" + "=" * 60)
+    print("JUDY NODE ANALYSIS")
+    print("=" * 60)
+
+    if not block.judy_nodes:
+        print("\nNo Judy nodes parsed")
+        return
+
+    # Group by type
+    by_type = {}
+    for node in block.judy_nodes:
+        if node.node_type not in by_type:
+            by_type[node.node_type] = []
+        by_type[node.node_type].append(node)
+
+    print(f"\nTotal Judy nodes: {len(block.judy_nodes)}")
+    print(f"Node types found: {len(by_type)}")
+
+    for node_type in sorted(by_type.keys()):
+        nodes = by_type[node_type]
+        print(f"\n  Type 0x{node_type:02X}: {len(nodes)} nodes")
+
+        # Show sample
+        for node in nodes[:3]:
+            keys_str = ', '.join(f'0x{k:X}' for k in node.keys[:4])
+            if len(node.keys) > 4:
+                keys_str += '...'
+            vals_str = ', '.join(f'0x{v:X}' for v in node.values[:4])
+            if len(node.values) > 4:
+                vals_str += '...'
+            print(f"    0x{node.offset:04X}: keys=[{keys_str}] values=[{vals_str}]")
+
 
 def analyze_table_refs(block: CompactBlock):
     """Analyze TABLE_REF distribution"""
@@ -963,6 +1565,88 @@ def analyze_array_elements(block: CompactBlock):
             print(f"    Type 0x{elem_type:02X}: {len(elems)} elements")
 
 
+def export_to_json(block: CompactBlock, output_path: str):
+    """Export parsed block to JSON"""
+    data = {
+        'regions': [],
+        'judy_nodes': [],
+        'table_refs': [],
+        'extended_values': [],
+        'array_elements': [],
+        'fixed_values': []
+    }
+
+    # Export regions
+    for region in block.regions:
+        region_data = {
+            'index': region.index,
+            'header_offset': region.header.offset,
+            'data_start': region.data_start,
+            'data_end': region.data_end,
+            'declared_size': region.declared_size,
+            'actual_size': region.actual_size,
+            'is_cross_block_ref': region.is_cross_block_ref
+        }
+        if region.gap_after:
+            region_data['gap'] = {
+                'offset': region.gap_offset,
+                'bytes': region.gap_after.hex()
+            }
+        data['regions'].append(region_data)
+
+    # Export Judy nodes
+    for node in block.judy_nodes:
+        data['judy_nodes'].append({
+            'offset': node.offset,
+            'type': node.node_type,
+            'count': node.count,
+            'key_size': node.key_size,
+            'keys': node.keys,
+            'values': node.values
+        })
+
+    # Export table refs
+    for ref in block.table_refs:
+        data['table_refs'].append({
+            'offset': ref.offset,
+            'table_id': ref.table_id,
+            'property_id': ref.property_id,
+            'type_name': ref.type_name
+        })
+
+    # Export extended values
+    for ext in block.extended_values:
+        val = ext.value
+        if isinstance(val, bytes):
+            val = val.hex()
+        data['extended_values'].append({
+            'offset': ext.offset,
+            'subtype': ext.subtype,
+            'value': val
+        })
+
+    # Export array elements
+    for elem in block.array_elements:
+        data['array_elements'].append({
+            'offset': elem.offset,
+            'element_type': elem.element_type,
+            'value': elem.value
+        })
+
+    # Export fixed values
+    for fv in block.fixed_values:
+        data['fixed_values'].append({
+            'offset': fv.offset,
+            'prefix': fv.prefix,
+            'value': fv.value
+        })
+
+    with open(output_path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+    print(f"\nExported to: {output_path}")
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -975,7 +1659,8 @@ def main():
 Examples:
   python compact_format_parser.py references/sav_block3_raw.bin
   python compact_format_parser.py references/sav_block5_raw.bin --verbose
-  python compact_format_parser.py references/sav_block3_raw.bin --analyze
+  python compact_format_parser.py references/sav_block3_raw.bin --regions --judy
+  python compact_format_parser.py references/sav_block3_raw.bin --json output.json
 """
     )
 
@@ -984,8 +1669,12 @@ Examples:
                         help='Print each parsed entry')
     parser.add_argument('--analyze', '-a', action='store_true',
                         help='Show detailed analysis of parsed data')
-    parser.add_argument('--output', '-o', type=str,
-                        help='Output JSON file for parsed data')
+    parser.add_argument('--regions', '-r', action='store_true',
+                        help='Show region breakdown with headers and gaps')
+    parser.add_argument('--judy', '-j', action='store_true',
+                        help='Show Judy node decoding with keys and values')
+    parser.add_argument('--json', type=str, metavar='FILE',
+                        help='Output structured JSON to file')
 
     args = parser.parse_args()
 
@@ -1003,19 +1692,30 @@ Examples:
     print(f"Size: {len(data):,} bytes")
 
     # Parse
-    parser_obj = CompactFormatParser(verbose=args.verbose)
+    parser_obj = CompactFormatParser(verbose=args.verbose, show_judy=args.judy)
     block = parser_obj.parse(data)
 
-    # Print header info
-    print(f"\nHeader:")
-    print(f"  Version: {block.header.version}")
-    print(f"  Data size: {block.header.data_size}")
-    print(f"  Flags: 0x{block.header.flags:08X}")
-    print(f"\nPreamble size: {len(block.preamble)} bytes")
-    print(f"Entries parsed: {len(block.entries)}")
+    # Print region info
+    if block.regions:
+        print(f"\nRegions found: {len(block.regions)}")
+        for region in block.regions:
+            status = " [CROSS-BLOCK REF]" if region.is_cross_block_ref else ""
+            print(f"  Region {region.index}: 0x{region.data_start:04X}-0x{region.data_end:04X} "
+                  f"({region.actual_size:,} bytes){status}")
+
+    print(f"\nEntries parsed: {len(block.entries)}")
+    print(f"Judy nodes parsed: {len(block.judy_nodes)}")
 
     # Print stats
     parser_obj.print_stats()
+
+    # Region analysis
+    if args.regions:
+        analyze_regions(block)
+
+    # Judy node analysis
+    if args.judy:
+        analyze_judy_nodes(block)
 
     # Detailed analysis
     if args.analyze:
@@ -1023,10 +1723,16 @@ Examples:
         analyze_extended_values(block)
         analyze_array_elements(block)
 
+    # JSON export
+    if args.json:
+        export_to_json(block, args.json)
+
     # Summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
+    print(f"  Regions:          {len(block.regions)}")
+    print(f"  Judy nodes:       {len(block.judy_nodes)}")
     print(f"  TABLE_REFs:       {len(block.table_refs)}")
     print(f"  Extended values:  {len(block.extended_values)}")
     print(f"  Array elements:   {len(block.array_elements)}")

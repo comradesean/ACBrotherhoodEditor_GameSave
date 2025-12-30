@@ -2052,22 +2052,60 @@ Uses 4-byte patterns: `[prefix] [type_indicator] [table_id] [property_index]`
 
 ## Appendix: Analysis Limitations
 
-### Property Hash Algorithm
+### Hash Algorithm Discovery (December 2024)
+
+**CONFIRMED: CRC32 (zlib.crc32)** is the hash function used for type and property hashes.
+
+**Verification Method:**
+- Extracted 199,399 unique strings from ACBSP.exe
+- Computed CRC32 hash for each string
+- Compared against known hashes from SAV files
+
+**Results:**
+- 7 type hash matches found (type names exist as debug strings)
+- 0 property name matches (property names stripped at compile time)
+
+#### Successfully Resolved Hashes (7 total)
+
+| Hash | Field Name | Location | Verified |
+|------|-----------|----------|----------|
+| `0x70A1EA5F` | Version | Block 1 | CRC32("Version") |
+| `0x78BD5067` | PlayerName | Block 1 | CRC32("PlayerName") |
+| `0x84A80CC2` | MissionHistory | Block 2 | CRC32("MissionHistory") |
+| `0x94D6F8F1` | AssassinSaveGameData | Block 2 (root type) | CRC32("AssassinSaveGameData") |
+| `0xA1A85298` | PhysicalInventoryItem | Block 4 | CRC32("PhysicalInventoryItem") |
+| `0xBB96607D` | ManagedObject | System base type | CRC32("ManagedObject") |
+| `0xFBB63E47` | World | Block 1, 2, 3 | CRC32("World") |
+
+#### Property Hash Statistics
+
+| Metric | Value |
+|--------|-------|
+| Total unique hashes in SAV | 53 |
+| Successfully resolved | 7 (13%) |
+| Block 1 unmapped properties | 10 of 12 |
+| Item ID hashes (Block 4) | 30 unique |
+
+### Why Property Names Cannot Be Resolved
 
 Property hashes cannot be reversed to string names because:
-1. The game uses a custom or modified hash algorithm
-2. Property names may be stripped from final binary
-3. Hashes may be compile-time constants
+1. **Property names are stripped at compile time** - the game only stores hashes at runtime
+2. Type names (like "SaveGame", "World") exist as debug strings
+3. Property names (like "Health", "Money") do NOT appear in the executable
+4. Hashes are 32-bit CRC32 values with no collision-resistant reversal
 
-**Tested algorithms (no match):**
-- FNV-1a (0x811c9dc5 offset, 0x01000193 prime)
-- CRC32 (0xEDB88320 polynomial)
-- DJB2
-- Jenkins one-at-a-time
-
-**Hash constants found in binary:**
+**Hash constants found in binary (unused for type system):**
 - FNV prime `0x01000193` at `0x01D8D058`
 - FNV offset `0x811c9dc5` at `0x01D8D0A3`
+
+### Future Resolution Methods
+
+| Method | Source | Effort |
+|--------|--------|--------|
+| Type Descriptor Table | Ghidra VA `0x027E0638` | Medium |
+| Type lookup function | `FUN_01AEAD60` | High |
+| Dynamic analysis | Cheat Engine value modification | Low |
+| SDK/Debug symbols | Ubisoft proprietary | N/A |
 
 ### Unknown Type Names
 

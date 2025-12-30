@@ -6,13 +6,15 @@ Quick reference for the 5-block structure of AC Brotherhood SAV files.
 
 ## Block Summary
 
-| Block | Format | Compressed | Decompressed | Primary Content |
-|-------|--------|------------|--------------|-----------------|
-| 1 | LZSS + Header | ~173 bytes | 283 bytes | SaveGame root object |
-| 2 | LZSS + Header | ~1,854 bytes | 32,768 bytes | Game state, missions, rewards |
-| 3 | Raw | 7,972 bytes | 7,972 bytes | World compact data |
-| 4 | LZSS (no header) | ~2,150 bytes | 32,768 bytes | Inventory (364 items) |
-| 5 | Raw | 6,266 bytes | 6,266 bytes | Additional compact data |
+| Block | Format | Header | Compressed | Decompressed | Primary Content |
+|-------|--------|--------|------------|--------------|-----------------|
+| 1 | Full (LZSS) | 44-byte (0xCD) | ~173 bytes | 283 bytes | SaveGame root object |
+| 2 | Full (LZSS) | 44-byte (0xCAFE00) | ~1,854 bytes | 32,768 bytes | Game state, missions, rewards |
+| 3 | Compact | None | 7,972 bytes | 7,972 bytes | World compact data |
+| **4** | **Full (LZSS)** | **10 zeros only** | **2,150 bytes** | **32,768 bytes** | **Inventory (364 items)** |
+| 5 | Compact | None | 6,266 bytes | 6,266 bytes | Additional compact data |
+
+**Block 4 Note:** Uses full format (4-byte type hashes) but uniquely has NO 44-byte header - only 10 zero bytes prefix.
 
 ---
 
@@ -32,19 +34,43 @@ Quick reference for the 5-block structure of AC Brotherhood SAV files.
 | Game State       |<-------->| World Compact    |
 | (0x94D6F8F1)     |  World   | (0xFBB63E47)     |
 | - MissionSaveData|  type    | TABLE_REF 0x5E   |
-| - RewardFault    |  hash    +------------------+
-| - PropertyRefs   |
-+--------+---------+
-         |
-         | PhysicalInventoryItem type hash
-         v
+| - RewardFault    |  hash    +--------+---------+
+| - PropertyRefs   |                   |
++--------+---------+                   |
+         |                             | Region 4 cross-block reference
+         | PhysicalInventoryItem       | (declared size = Block 4 size)
+         | type hash                   |
+         v                             v
 +------------------+          +------------------+
-|     Block 4      |          |     Block 5      |
-| Inventory Items  |          | Compact Data     |
-| (0xA1A85298)     |          | TABLE_REF 0x4F   |
-| 364 items total  |          |                  |
-+------------------+          +------------------+
+|     Block 4      |<---------| Block 3 Region 4 |
+| Inventory Items  |  LINKED  | Reference desc:  |
+| (0xA1A85298)     |          | 00 27 a6 62 20   |
+| 364 items total  |          +------------------+
++------------------+
+         ^
+         |          +------------------+
+         |          |     Block 5      |
+         +----------| PropertyRef Data |
+           (refs)   | Region 2: +2049b |
+                    | growth buffer    |
+                    +------------------+
 ```
+
+### Block 3 -> Block 4 Relationship (CRITICAL)
+
+Block 3 Region 4 contains a **cross-block reference descriptor** that points to Block 4:
+
+| Property | Value |
+|----------|-------|
+| Region 4 declared size | 2,150 bytes |
+| Block 4 LZSS compressed size | 2,150 bytes |
+| Region 4 actual data | 5 bytes: `00 27 a6 62 20` |
+
+This establishes a direct link between:
+- **Block 3** (compact format World state metadata)
+- **Block 4** (LZSS-compressed inventory items)
+
+The relationship is: Block 3 provides metadata/references for the inventory items stored in Block 4.
 
 ---
 
@@ -56,10 +82,13 @@ Quick reference for the 5-block structure of AC Brotherhood SAV files.
 | 0x94D6F8F1 | AssassinSaveGameData | - | ROOT | - | - | - |
 | 0xFBB63E47 | World | ref | x2 | PRIMARY | - | - |
 | 0x5FDACBA0 | SaveGameDataObject | ref | x2 | - | - | - |
-| 0xA1A85298 | PhysicalInventoryItem | - | - | - | x364 | - |
-| 0x0984415E | PropertyReference | - | x21 | - | x364 | - |
+| 0xA1A85298 | PhysicalInventoryItem | - | - | - | x364 | x1 |
+| 0x0984415E | PropertyReference | - | x21 | - | x182 | - |
 | 0x5ED7B213 | MissionSaveData | - | x3 | - | - | - |
 | 0x12DE6C4C | RewardFault | - | x2 | - | - | - |
+| 0x9BD7FCBE | CollectibleRecord | - | x157 | - | - | - |
+| 0x75758A0E | CollectibleClass | - | x157 | - | - | - |
+| 0x768CAE23 | CollectibleParent | - | x157 | - | - | - |
 
 ---
 
@@ -92,13 +121,71 @@ SAVE OPERATION:
 
 ## Compression Summary
 
-| Block | Has Header | Header Marker | Compressed Size Field |
-|-------|------------|---------------|----------------------|
-| 1 | Yes (44 bytes) | 0x000000CD | Offset 0x20 |
-| 2 | Yes (44 bytes) | 0x00CAFE00 | Offset 0x20 |
-| 3 | No | N/A | Raw data |
-| 4 | No | N/A | Calculated |
-| 5 | No | N/A | Fixed 6,266 bytes |
+| Block | Has Header | Header Marker | Compressed Size | Notes |
+|-------|------------|---------------|-----------------|-------|
+| 1 | Yes (44 bytes) | 0x000000CD | Offset 0x20 | Standard full format |
+| 2 | Yes (44 bytes) | 0x00CAFE00 | Offset 0x20 | CAFE00 deserializer |
+| 3 | No | N/A | N/A (Raw) | Compact format |
+| **4** | **No (10 zeros)** | **N/A** | **2,150 bytes** | **Full format, no header** |
+| 5 | No | N/A | N/A (Raw) | Compact format |
+
+**Block 4 Discovery:** The only LZSS-compressed block without a 44-byte header. Uses full format serialization but compressed size (2,150) matches Block 3 Region 4's declared size exactly - establishing a cross-block reference.
+
+---
+
+## Block 4 Item Formats
+
+Block 4 contains 364 PhysicalInventoryItem entries in two interleaved formats:
+
+| Format | Marker at +04 | Count | Size Range | Total Bytes | Purpose |
+|--------|---------------|-------|------------|-------------|---------|
+| Format 1 | 0x0032 | 182 | 66-71 bytes | 12,381 | Simple stackable items |
+| Format 2 | 0x0000 | 182 | 22-1,236 bytes | 20,306 | Complex/variable items |
+
+**Format Detection:** Check 2 bytes at offset +04 after the type hash (0xA1A85298):
+- `0x0032` = Format 1 (simple stackable, fixed structure)
+- `0x0000` = Format 2 (complex, variable length)
+
+**Key Findings:**
+- Items are **interleaved** (72 format transitions), not separated by format type
+- All Format 1 items have quantity=42 (max stack size)
+- Largest single item: 1,236 bytes (Format 2)
+- 1:1 PropertyReference binding for Format 1 items only
+
+---
+
+## Block 2 Collectibles Array (DECODED)
+
+Block 2 contains a 157-entry collectibles array storing the collected/uncollected state for all feathers and flags:
+
+| Property | Value |
+|----------|-------|
+| Location | 0x03E8 - 0x40D7 |
+| Size | 15,600 bytes (47.6% of Block 2) |
+| Entry Count | 157 (100 feathers + 57 flags) |
+| Entry Size | ~99 bytes each |
+| Format | Full format (4-byte hashes, byte-aligned) |
+
+### Entry Structure (98 bytes)
+
+```
++0x00: Field 0 (18 bytes) - Class reference (0x75758A0E)
++0x12: Field 1 (18 bytes) - Parent reference (0x768CAE23 -> World)
++0x24: Field 2 (18 bytes) - Instance reference (0x309E9CEF)
++0x36: Field 3 (18 bytes) - State value (0x00 = uncollected)
++0x48: Footer (26 bytes)  - Record type (0x9BD7FCBE)
+```
+
+### State Values
+
+| Value | Count | Meaning |
+|-------|-------|---------|
+| 0x00 | 156 | Uncollected |
+| 0x19 | 1 | Special marker (story-related) |
+
+### World Object Link
+
+All 157 collectible entries link to the World object at offset 0x0212 via the parent reference hash 0x768CAE23.
 
 ---
 
@@ -111,6 +198,35 @@ SAVE OPERATION:
 | 0x20 | - | - | World (0xFBB63E47) |
 | 0x4F | - | 61 | CompactType_4F (0xF49BFD86) |
 | 0x3B | 1 | - | CompactType_3B (0xFC6EDE2A) |
+
+## Compact Format Region Structure
+
+### Block 3 Regions (4 nested headers)
+
+| Region | Offset Range | Content | Notes |
+|--------|--------------|---------|-------|
+| 1 | 0x0008-0x0E41 | CompactType_5E objects | 72 TABLE_REFs, primary World state |
+| 2 | 0x0E4E-0x15A3 | Item references | PhysicalInventoryItem hash 0xA1A85298 |
+| 3 | 0x15B0-0x1F12 | Numeric counters | 29.8% VARINT, game statistics |
+| 4 | 0x1F1F-0x1F24 | **Block 4 reference** | Declared=2150, Actual=5 bytes |
+
+### Block 5 Regions (2 nested headers)
+
+| Region | Offset Range | Content | Notes |
+|--------|--------------|---------|-------|
+| 1 | 0x0008-0x075F | PropertyReference data | 5 TABLE_REFs |
+| 2 | 0x076C-0x187A | Extended data + buffer | +2,049 bytes growth space |
+
+### Inter-Region Gaps
+
+All gaps between regions use 5-byte format: `[type] [value_16 LE] [0x20 0x00]`
+
+| Gap | Bytes | Purpose |
+|-----|-------|---------|
+| Block 3: 1->2 | `04 74 62 20 00` | Region separator |
+| Block 3: 2->3 | `00 00 28 20 00` | Region separator |
+| Block 3: 3->4 | `00 00 a7 20 00` | Region separator |
+| Block 5: 1->2 | `00 00 e5 20 00` | Region separator |
 
 ---
 
@@ -151,3 +267,5 @@ Offset      Size        Block
 ---
 
 *Generated from block-specific documentation. See individual files for complete details.*
+
+*Last updated: December 30, 2024 - Added Block 2 collectibles array analysis (157 entries, 100 feathers + 57 flags).*

@@ -1007,6 +1007,142 @@ These functions handle the file-level operations for reading/writing SAV and OPT
 
 These functions were identified through WinDbg time-travel debugging during SAV file loading. They form the core deserialization pipeline for both full format (Blocks 2/4) and compact format (Blocks 3/5).
 
+#### Address Mapping
+
+**CRITICAL:** WinDbg runtime addresses must be converted to Ghidra static addresses:
+
+| Base | Description | Value |
+|------|-------------|-------|
+| WinDbg runtime | Module base (varies with ASLR) | Example: `0x00F30000` |
+| Ghidra static | Default analysis base | `0x00400000` |
+
+**Conversion formula:** `Ghidra VA = 0x400000 + WinDbg offset`
+
+**Example:** WinDbg `ACBSP+0x1711ab0` = Ghidra `0x01B11AB0`
+
+#### Parsing Pipeline Functions
+
+These functions form the main SAV parsing pipeline (discovered via TTD tracing):
+
+| Function (Ghidra) | Size | Purpose |
+|-------------------|------|---------|
+| `FUN_01B7A1D0` | - | Detects OPTIONS magic (`0x57FBAA33`, `0x1004FA99`) |
+| `FUN_01B7B190` | - | Decompresses OPTIONS-style headers (32KB chunks) |
+| `FUN_01B6F730` | 0x38 | Creates stream reader object |
+| `FUN_01B49250` | 0x1058 | Creates parser object (vtable at `0x02555C60`) |
+| `FUN_01AEDD90` | 0x12d8 | Pushes parser state onto stack |
+| `FUN_01AFD600` | - | **Main deserializer orchestrator** |
+| `FUN_01B0A740` | - | Object extraction/deserialization |
+| `FUN_01B08CE0` | - | **ObjectInfo metadata parser** |
+
+#### CAFE00 Deserializer (FUN_01B11AB0)
+
+The Block 2 format deserializer at Ghidra VA `0x01B11AB0`:
+
+**Validation:**
+- Checks: `type == 1 && magic == 0x00CAFE00`
+- Skips 8-byte header (`piVar1 + 2`)
+
+**Processing:**
+1. Calls `FUN_00425360` to set up buffer descriptor
+2. Calls `FUN_01AFD600` for parsing
+3. Returns deserialized object via `FUN_01AFD600`
+
+**Note:** `FUN_00425360` is a buffer descriptor setter, NOT a parser.
+
+#### Parser Vtable at 0x02555C60 (Updated December 2024)
+
+The parser object created by `FUN_01B49250` uses this vtable:
+
+| Offset | Slot | Function | Purpose |
+|--------|------|----------|---------|
+| 0x00 | 0 | `FUN_01B49B10` | Constructor/base |
+| 0x08 | 2 | `LAB_01B48770` | BeginElement |
+| 0x10 | 4 | `LAB_01B487A0` | EndElement |
+| 0x50 | 20 | `FUN_01B48FB0` | Read type hash ("T") |
+| 0x54 | 21 | `FUN_01B48E90` | Read ObjectName |
+| 0x84 | 33 | `FUN_01B48C10` | Read ClassID / PropertyID |
+| 0x8c | 35 | `FUN_01B48C00` | Read Version |
+| 0x98 | 38 | `FUN_01B48B70` | Read PackedInfo (→ FUN_01B49430) |
+| 0x9c | 39 | `FUN_01B48E70` | Read ObjectID |
+
+**Vtable Dispatch Pattern (December 2024 discovery):**
+```c
+// FUN_01B48B70 - Slot 38 dispatcher
+// Resolves parser→stream_reader chain and calls stream reader methods
+if (parser[5] != 0) {
+    stream_reader = parser[6];  // parser+0x18 = stream reader pointer
+    result = (*stream_reader->vtable[9])();  // Read method
+}
+```
+
+#### Stream Reader Architecture (December 2024)
+
+The parser object delegates actual byte reading to a Stream Reader object.
+
+**Stream Reader Factory:** `FUN_01B6F730`
+**Stream Reader Constructor:** `FUN_01B6F590`
+**Stream Reader Size:** 0x38 bytes
+
+**Stream Reader Vtable (0x02556168):**
+
+| Offset | Slot | Function | Purpose |
+|--------|------|----------|---------|
+| 0x00 | 0 | `FUN_01B6F500` | Destructor |
+| 0x04 | 1 | `FUN_01B6F3B0` | Read bytes (buffer, count) |
+| 0x08 | 2 | `FUN_01B6F2F0` | Read with callback |
+| 0x0C | 3 | `FUN_01B6F2E0` | Stub |
+| 0x10 | 4 | `FUN_01B6F290` | Read N bytes |
+| 0x14 | 5 | `FUN_01B6F220` | Skip bytes |
+| 0x18 | 6 | `FUN_01B6F210` | Get remaining |
+| 0x1C | 7 | `FUN_01B6F200` | Check EOF |
+| 0x20 | 8 | `FUN_01B6F1F0` | Stub |
+| 0x24 | 9 | `FUN_01B6F150` | **Read single byte** |
+| 0x28 | 10 | `FUN_01B6F140` | Stub |
+| 0x38 | 14 | `FUN_01B6F5E0` | Init/Reset |
+| 0x3C | 15 | `FUN_01B6F370` | **Write byte** |
+
+**Key Read Function (FUN_01B6F150):**
+```c
+// Returns single byte from buffer
+if (read_pos < end_pos) {
+    byte = *read_pos;
+    read_pos++;
+    return byte;
+}
+return -1;  // EOF
+```
+
+**Object Layout:**
+```
+Offset  Field
+0x00    vtable pointer (→ 0x02556168)
+0x04    field_04
+0x08    buffer_start
+0x0C    buffer_end
+0x10    current_pos
+...
+0x38    total size
+```
+
+#### ObjectInfo Fields (FUN_01B08CE0)
+
+The ObjectInfo metadata parser extracts these fields in order:
+
+1. **SerializerVersion** - Serializer format version
+2. **ClassVersion** - Class schema version
+3. **NbClassVersionsInfo** - Count of version entries
+4. **VersionClassID + Version pairs** - Per-class versions
+5. **ObjectName** - Object instance name (string)
+6. **ObjectID** - Unique object identifier
+7. **InstancingMode** - How object is stored:
+   - `0x01` = child object
+   - `0x02` = embedded object
+8. **FatherID** - Parent object ID
+9. **Type hash ("T")** - Object type hash
+
+---
+
 #### Address Conversion Table
 
 | Function | Ghidra VA | Runtime VA (Base=0xF30000) | WinDbg Offset |
@@ -1025,81 +1161,107 @@ These functions were identified through WinDbg time-travel debugging during SAV 
 
 ---
 
-#### FUN_01AF6A40 - Buffer Deserializer with Prefix Dispatch
+#### FUN_01AF6A40 - TYPE_REF Dispatcher (Updated December 2024)
 
 **Address:** `0x01AF6A40` (Ghidra VA)
 
-**Purpose:** Reads serialized data from a buffer and dispatches based on the first byte prefix. This is a key function for reading typed object references from the stream.
+**Purpose:** The central TYPE_REF dispatcher for reading typed object references from serialized data. Reads a prefix byte and dispatches to appropriate handler based on the reference type.
+
+**IMPORTANT:** This function uses **4-byte TYPE HASHES**, NOT nibble-encoded table IDs. It is used by the "full format" deserialization path (Blocks 1, 2, 4), not the compact format (Blocks 3, 5).
 
 **Signature:**
 ```c
-void __thiscall FUN_01af6a40(int param_1, undefined4 type_hash, int* output_ptr, undefined4 callback_ptr);
+void __thiscall FUN_01af6a40(int param_1, undefined4 expected_type_hash, int* output_ptr, undefined4 callback_ptr);
 ```
 
 **Parameters:**
 - `param_1` (ECX): Context object with buffer state
-  - `param_1[5]` = Current read position
+  - `param_1[5]` = Current read position pointer
   - `param_1[6]` = End of buffer position
-- `type_hash`: Type hash for validation
-- `output_ptr`: Where to store the result
-- `callback_ptr`: Callback function pointer
+- `expected_type_hash`: Expected type hash for validation
+- `output_ptr`: Where to store the result pointer
+- `callback_ptr`: Callback function pointer for post-processing
 
-**Dispatch Logic:**
+**Dispatch Logic (TTD-verified):**
 ```c
-cVar8 = *(char *)param_1[5];  // Read first byte
-param_1[5] = param_1[5] + 1;  // Advance position
+prefix = read_byte();         // Read prefix byte
+switch (prefix) {
+    case 0x00:  // Full object with nested deserialization
+        type_hash = read_uint32();       // Read 4-byte TYPE HASH
+        object = FUN_01aeb020(type_hash, 0);  // Create/get object by hash
+        // ... invoke callback for nested deserialization
+        break;
 
-if (cVar8 == '\0') {          // Case 0x00: Direct object reference
-    uVar5 = *(undefined4 *)param_1[5];  // Read 4-byte value
-    param_1[5] = param_1[5] + 4;
-    iVar10 = FUN_01aeb020(uVar5, 0);     // Create/get object by ID
-    // ... handle callback
-}
-else if (cVar8 == '\x01') {   // Case 0x01: Indirect reference
-    uVar5 = *(undefined4 *)param_1[5];  // Read 4-byte value
-    param_1[5] = param_1[5] + 4;
-    FUN_01af6420(param_1, uVar5, output_ptr);  // Indirect lookup
-}
-else {                        // Case else: Direct assignment
-    // Direct value handling
+    case 0x01:  // Type reference with validation
+        sub_type = read_byte();          // Read 1-byte sub-type
+        type_hash = read_uint32();       // Read 4-byte TYPE HASH
+        FUN_01af6420(param_1, type_hash, output_ptr);  // Indirect lookup
+        break;
+
+    default:    // >= 0x02: Simple object reference
+        type_hash = read_uint32();       // Read 4-byte TYPE HASH
+        // Direct value handling
+        break;
 }
 ```
 
 **Cross-References:** 400+ callers throughout the codebase
 
-**Purpose:** Central dispatcher for reading object references. The three cases handle:
-- `0x00`: Object by numeric ID (calls FUN_01AEB020)
-- `0x01`: Object by type chain (calls FUN_01AF6420)
-- `else`: Direct inline value
+**Prefix Byte Semantics:**
+| Prefix | Meaning | Data Following | Handler |
+|--------|---------|----------------|---------|
+| `0x00` | Full object | 4-byte type hash | FUN_01AEB020 + nested deser |
+| `0x01` | Type reference | 1-byte sub-type + 4-byte hash | FUN_01AF6420 |
+| `≥0x02` | Simple reference | 4-byte type hash | Direct assignment |
+
+**Key Insight:** This dispatcher is the entry point for all typed object references in the full format serialization used by Blocks 1, 2, and 4. The compact format (Blocks 3, 5) uses a completely different code path that has NOT been traced yet.
 
 ---
 
-#### FUN_01AEB020 - Table ID Object Creator/Retriever
+#### FUN_01AEB020 - Type Hash Object Creator/Retriever (Updated December 2024)
 
 **Address:** `0x01AEB020` (Ghidra VA)
 
-**Purpose:** Creates or retrieves an object instance by its table ID. This is the primary function for instantiating typed objects during deserialization.
+**Purpose:** Creates or retrieves an object instance by its **TYPE HASH** (not table ID). This is a wrapper around FUN_01AEAD60, which performs the actual type lookup.
+
+**IMPORTANT CORRECTION:** Previous documentation incorrectly stated this takes a "table_id". It actually takes a **4-byte type hash**. This function is called by the TYPE_REF dispatcher (FUN_01AF6A40) with type hashes read from the data stream.
 
 **Signature:**
 ```c
-int __thiscall FUN_01aeb020(int this, int table_id, int flags);
+int __thiscall FUN_01aeb020(int this, uint32_t type_hash, int flags);
 ```
 
 **Parameters:**
-- `table_id`: Type table identifier (0x00-0x67 for compact types)
+- `type_hash`: 4-byte type hash (e.g., `0xBDBE3B52` for SaveGame)
 - `flags`: Usually 0
 
 **Return Value:** Pointer to the object instance
 
+**Call Chain:**
+```
+FUN_01AEB020 (wrapper)
+    → FUN_01AEAD60 (core lookup function)
+        → Type registry lookup by hash
+        → Object instantiation
+```
+
 **Cross-References:** 400+ callers, including:
+- TYPE_REF dispatcher (FUN_01AF6A40) for full format deserialization
 - Graphics initialization (FUN_01C50A00)
 - Save deserialization
 - World object creation
 
-**Observed Table IDs (from WinDbg trace):**
+**Contrast with FUN_01AEAF70:**
+| Function | Input | Used By |
+|----------|-------|---------|
+| FUN_01AEB020 | 4-byte type hash | Full format (Blocks 1, 2, 4) |
+| FUN_01AEAF70 | Nibble-encoded table ID | Compact format (Blocks 3, 5) |
+
+**Observed Type Hashes (from WinDbg trace):**
+These are full 32-bit type hashes, NOT small table IDs:
 ```
-0x08, 0x09, 0x20, 0x21, 0x24, 0x25, 0x26, 0x2e, 0x2f, 0x30, 0x31, 0x32,
-0x46, 0x48, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f
+0xBDBE3B52 (SaveGame), 0x94D6F8F1 (AssassinSaveGameData),
+0xFBB63E47 (World), 0xA1A85298 (PhysicalInventoryItem), etc.
 ```
 
 ---
@@ -1496,6 +1658,23 @@ int __thiscall FUN_01aea0b0(int this, int* param_2, int* param_3)
 }
 ```
 
+#### Table ID Encoding Formula
+
+The Table ID is extracted from the type descriptor at offset `+0x04`:
+
+```c
+raw_value = type_desc[+4] & 0xC3FFFFFF;  // Mask out upper 2 bits (0x3C000000)
+table_id = raw_value - 1;                 // Subtract 1 for 0-based index
+bucket_index = table_id >> 14;            // Upper bits = bucket (pool index)
+entry_index = table_id & 0x3FFF;          // Lower 14 bits = entry (max 16383)
+address = table[bucket * 12] + entry * 16;  // Final address calculation
+```
+
+**Key constraints:**
+- Maximum 16383 entries per bucket (14 bits)
+- Each bucket entry is 12 bytes
+- Each type handle is 16 bytes
+
 #### Handle Structure (16 bytes)
 
 Type handles are 16-byte structures stored in pools:
@@ -1653,6 +1832,28 @@ Example from SAV data:
 | `0x00421110` | FUN_00421110 | Generated full format deserializer |
 | `0x00427530` | FUN_00427530 | TYPE_REF serializer |
 | `0x004274A0` | FUN_004274A0 | Custom function serializer |
+| `0x01B11AB0` | FUN_01B11AB0 | **CAFE00 deserializer** (Block 2) |
+| `0x01B7A1D0` | FUN_01B7A1D0 | OPTIONS magic detector |
+| `0x01B7B190` | FUN_01B7B190 | OPTIONS header decompressor |
+| `0x01AFD600` | FUN_01AFD600 | **Main deserializer orchestrator** |
+| `0x01B0A740` | FUN_01B0A740 | Object extraction/deserialization |
+| `0x01B08CE0` | FUN_01B08CE0 | **ObjectInfo metadata parser** |
+| `0x01B6F730` | FUN_01B6F730 | Stream reader object creator (0x38 bytes) |
+| `0x01B49250` | FUN_01B49250 | Parser object creator (0x1058 bytes) |
+| `0x01AEDD90` | FUN_01AEDD90 | Parser state pusher (0x12d8 bytes) |
+
+### Functions That Are NOT Deserializers
+
+**IMPORTANT:** These functions are often encountered during debugging but are utility functions, not parsers:
+
+| Address | Function | Actual Purpose |
+|---------|----------|----------------|
+| `0x01ADCC30` | FUN_01ADCC30 | Custom heap `free()` - memory deallocation |
+| `0x01AE44F0` | FUN_01AE44F0 | Simple initializer - zeros two dwords |
+| `0x00425360` | FUN_00425360 | Buffer descriptor setter - NOT a parser |
+| `0x005E4B10` | FUN_005E4B10 | SaveGameWriter::ReadFile - raw disk I/O only |
+
+Avoid confusing these with deserializers when tracing.
 
 ### Type Descriptor Locations
 

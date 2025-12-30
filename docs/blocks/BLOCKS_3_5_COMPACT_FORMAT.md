@@ -1,12 +1,52 @@
 # SAV Blocks 3 and 5 Compact Format Specification
 
+> **Investigation Status: PAUSED** (December 30, 2024)
+>
+> The nibble extraction code for table IDs has not been located. We traced deep into
+> the PropertyData handler chain but found only raw byte readers. The compact format
+> parsing path appears separate from the TYPE_REF dispatcher (which uses 4-byte hashes).
+> See HANDOFF_SAV_DESERIALIZERS.md for detailed session notes and next steps.
+
 ## Overview
 
 Blocks 3 and 5 in AC Brotherhood SAV files use a compact binary format for serializing game object properties. Unlike Blocks 2 and 4 which use LZSS compression with raw type hashes, these blocks use table ID lookup for type resolution, resulting in more compact property references.
 
 ### Deserializer
 
-These blocks use the **Raw deserializer** (`FUN_01712660` at Ghidra VA `0x01712660`). Unlike the CAFE00, 11FACE11, and 21EFFE22 format handlers which validate an 8-byte header, the Raw deserializer performs no header check and copies the block data directly for processing. This is consistent with Blocks 3 and 5 being uncompressed and having no format magic.
+**Updated Finding (December 2024):** Blocks 3 and 5 are NOT processed through the main block deserializer vtable dispatch. Instead, they are processed as **PropertyData** through `FUN_01b11a50`.
+
+The PropertyData handler checks the version byte at the start of the data:
+- Version `0x01`: Routes to `FUN_01b702e0` or `FUN_01b70450`
+- Version `0x02`: Routes to `FUN_01b70380` or `FUN_01b704f0`
+- Version `0x03`: Routes to `FUN_01b71200` or `FUN_01b709a0`
+
+Since Blocks 3 and 5 start with version byte `0x01`, they are handled by the Version 1 handlers.
+
+**Previous Understanding (Partially Incorrect):**
+- The Raw deserializer (`FUN_01712660`) was previously thought to handle these blocks
+- TTD tracing confirmed this is NOT the entry point for Blocks 3/5
+
+**Note:** The magic values `0x11FACE11` and `0x21EFFE22` are OPTIONS file section markers, not SAV block format identifiers. SAV blocks use different content formats (see below).
+
+### Table ID Lookup System
+
+The compact format uses table IDs to reference types. The lookup is performed by `FUN_01AEAF70`:
+
+**Call chain:** `FUN_01AEAF70` -> `FUN_01AEAD60` -> `FUN_01AEA0B0`
+
+**Table ID Encoding** (from `type_descriptor[+4]`):
+```c
+raw_value = type_desc[+4] & 0xC3FFFFFF;
+table_id = raw_value - 1;
+bucket_index = table_id >> 14;       // Upper bits = bucket
+entry_index = table_id & 0x3FFF;     // Lower 14 bits = entry (max 16383)
+address = table[bucket * 12] + entry * 16;
+```
+
+**Table structure** (at `[manager + 0x98]`):
+- Count at `[manager + 0x9E]` (masked with 0x3FFF)
+- Each bucket: 12 bytes (3 dwords)
+- Each entry: 16 bytes (4 dwords)
 
 ## Block Characteristics
 
@@ -95,6 +135,29 @@ The data region uses 2-byte prefixes to indicate data types:
 | 0x1809 | PREFIX_1809 | 19 | 0 |
 | 0x0C18 | EXTENDED | 14 | 1 |
 | 0x1006 | PREFIX_1006 | 11 | 2 |
+
+#### PREFIX_1C04 Sub-Type Distribution (Block 3)
+
+The byte following PREFIX_1C04 acts as a sub-type discriminator:
+
+| Sub-Type | Count | Purpose (Hypothesis) |
+|----------|-------|----------------------|
+| 0x0B (11) | 23 | Small signed/unsigned integers (most common) |
+| 0x0A (10) | 15 | Small signed/unsigned integers |
+| 0x25 (37) | 10 | Type reference or property ID |
+| 0x08 (8) | 5 | Boolean or byte values |
+| 0x24 (36) | 5 | Type reference or property ID |
+| 0x23 (35) | 2 | Special marker |
+| 0x14 (20) | 1 | Special marker |
+| 0x21 (33) | 1 | Special marker |
+
+#### PREFIX_173C Clustering (Block 3)
+
+PREFIX_173C exhibits notable clustering behavior:
+
+- Appears at only **two locations** in Block 3: offset `0x1117` and `0x1C60`
+- Dense clusters with minimal intervening bytes suggest **array elements** or **repeated structures**
+- The pattern `17 3C 00 00 00 00` at offset `0x116F` may indicate a **null/terminator** encoding
 
 ## TABLE_REF Format (0x0803)
 
@@ -205,6 +268,25 @@ Table 0x5E is the dominant type in Block 3 with 63 references across 42 unique p
 | 0xBB, 0xBE, 0xC1, 0xC4, 0xCA | 5 | Flags/config |
 | 0xD0, 0xD3, 0xD6, 0xD9 | 4 | End group |
 
+### Complete Property Index List (Reference Data)
+
+The following 42 unique property indices were observed for Table 0x5E in Block 3:
+
+```
+0x01, 0x05, 0x34, 0x35, 0x37, 0x38, 0x3A, 0x6C,
+0x90, 0x96, 0x9D, 0x9E, 0xA0, 0xA2, 0xA3, 0xA4,
+0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC,
+0xAD, 0xAF, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7,
+0xB8, 0xBB, 0xBE, 0xC1, 0xC4, 0xCA, 0xD0, 0xD3,
+0xD6, 0xD9
+```
+
+**Nibble Distribution Statistics:**
+- Low nibbles (prop_id & 0x0F): All 16 values present (0x0-0xF)
+- High nibbles (prop_id >> 4): 8 values present (0, 3, 6, 9, A, B, C, D)
+
+**Note:** The nibble extraction code for these property indices has NOT been located in Ghidra analysis. The distribution pattern is documented here as observational data only. See "Future Research" section for investigation status.
+
 ## Value Prefixes
 
 ### VALUE_1500 Format
@@ -274,14 +356,55 @@ Based on structural analysis:
 
 ## Comparison to Blocks 2/4
 
-| Aspect | Blocks 2/4 | Blocks 3/5 |
-|--------|------------|------------|
+| Aspect | Blocks 1/2/4 (Full Format) | Blocks 3/5 (Compact Format) |
+|--------|----------------------------|----------------------------|
 | Compression | LZSS compressed | Uncompressed |
 | Type encoding | Raw 4-byte hashes | 1-byte table IDs |
 | Property encoding | Offset-based | Index-based |
-| Size | 32KB each (decompressed) | 7.9KB / 6.3KB |
-| Format deserializer | CAFE00 (`FUN_01711ab0`) | Raw (`FUN_01712660`) |
-| Inner header | 8-byte (type + magic) | None |
+| Size | 283 / 32KB / 32KB (decompressed) | 7.9KB / 6.3KB |
+| Format deserializer | `FUN_01711ab0` (Block 2) | PropertyData via `FUN_01b11a50` |
+| Content header | 10 null bytes + type hash | Version prefix (0x01) + size + flags |
+| Entry point | vtable[10] dispatch | PropertyData version dispatch |
+
+## TYPE_REF Format (FUN_01af6a40)
+
+The TYPE_REF dispatcher at `FUN_01af6a40` (offset `+0x16f6a40`) handles type references using a prefix byte:
+
+### Prefix Byte Dispatch
+
+| Prefix | Format | Description |
+|--------|--------|-------------|
+| `0x00` | Full object | Nested deserialization with full object data |
+| `0x01` | Type reference | Validation + sub-type byte + 4-byte type hash |
+| `>= 0x02` | Simple reference | Direct object lookup by reference ID |
+
+### Type Reference Structure (Prefix 0x01)
+
+```
+01 [sub_type] [type_hash: 4 bytes LE]
+
+Example: 01 05 5E 41 98 0D
+         |  |  |
+         |  |  +-- Type hash: 0x0D98415E
+         |  +-- Sub-type byte
+         +-- Prefix: type reference
+```
+
+### Full Object Structure (Prefix 0x00)
+
+```
+00 [object_data...]
+
+The object data is recursively deserialized using the same pipeline.
+```
+
+### Simple Reference Structure (Prefix >= 0x02)
+
+```
+[ref_id]
+
+Where ref_id >= 2. The object is looked up from a reference table.
+```
 
 ## Implementation Notes
 
@@ -321,11 +444,73 @@ From `sav_parser.py` TYPE_HASHES dictionary:
 
 ## Future Research
 
-1. **Table ID Resolution**: Map remaining table IDs (0x5E, 0x5B, etc.) to type hashes via Ghidra analysis
-2. **Prefix Semantics**: Determine exact meaning of PREFIX_1C04, PREFIX_173C, etc.
-3. **Preamble Structure**: Decode the preamble format for object initialization
-4. **Value Encoding**: Understand the full protobuf-like wire format being used
-5. **Cross-Block References**: Investigate how Blocks 3/5 relate to Blocks 2/4
+### High Priority - Nibble Extraction Hunt (PAUSED)
+
+**December 30, 2024 Session Results:**
+
+We traced the PropertyData handler chain completely:
+
+```
+FUN_01b11a50 (PropertyData version dispatcher)
+  → FUN_01b702e0 (Version 1 initializer) - Just sets up 16-byte structure, NO parsing
+  → FUN_01b70450 (Version 1 field reader) - Reads PackedInfo/ObjectID/PropertyID via vtable
+    → Parser vtable[38] → FUN_01b48b70 → FUN_01b49430 (dispatcher)
+      → Stream reader vtable[9] → FUN_01b6f150 (single byte reader, NO nibble logic)
+```
+
+**Key Finding:** The TYPE_REF dispatcher (`FUN_01af6a40`) uses 4-byte type hashes, NOT nibble table IDs. The compact format must use a completely different parsing path.
+
+### Unresolved Questions
+
+1. **Where is nibble extraction?** Not in PropertyData handlers or stream readers we traced
+2. **Is "PackedInfo" the nibble data?** The field might contain encoded data decoded elsewhere
+3. **Alternative code path?** Compact format may bypass the PropertyData handlers entirely
+4. **TTD verification needed** - Set breakpoint on `FUN_01aeaf70` (table ID lookup) during Block 3/5 load
+
+### Suggested Next Steps
+
+1. **Examine raw data** - Look at actual bytes at offset 8+ in Block 3/5 for patterns
+2. **Search Ghidra** for `SHR reg, 4` and `AND reg, 0x0F` patterns
+3. **TTD trace** with breakpoint on FUN_01aeaf70 when Blocks 3/5 are loaded
+4. **Check Version 2/3 handlers** - Maybe different version handlers have nibble logic
+5. **Cross-reference callers** of FUN_01aeaf70 - find who passes table IDs
+
+### Analyzed Functions (No Nibble Logic Found)
+
+| Function | Purpose | Result |
+|----------|---------|--------|
+| FUN_01b702e0 | Version 1 initializer | Just sets vtable/flags, no parsing |
+| FUN_01b70450 | Version 1 field reader | Reads via vtable dispatch |
+| FUN_01b48b70 | Parser PackedInfo reader | Wrapper for FUN_01b49430 |
+| FUN_01b49430 | Parser dispatcher | Routes to stream reader |
+| FUN_01b6f150 | Stream byte reader | Single byte read, no nibble logic |
+| FUN_01af6a40 | TYPE_REF dispatcher | Uses 4-byte hashes, not table IDs |
+| FUN_01aeb020 | Type hash lookup | Wrapper for FUN_01aead60 |
+| FUN_01aead60 | Core type lookup | Table management, no nibble extraction |
+
+### Key Breakpoints for Continued Research
+
+```
+# PropertyData path (already traced, no nibble logic)
+bp ACBSP+0x1711a50   # PropertyData version dispatcher
+bp ACBSP+0x1770de0   # Version 1 handler A (FUN_01b702e0) - TRACED
+bp ACBSP+0x1770450   # Version 1 handler B (FUN_01b70450) - TRACED
+
+# Type lookup (need to trace during Block 3/5 load)
+bp ACBSP+0x1AEAF70   # Table ID lookup - SET THIS during Block 3/5 load!
+bp ACBSP+0x16f6a40   # TYPE_REF dispatcher - uses hashes, not IDs
+
+# Stream readers
+bp ACBSP+0x176f150   # Single byte reader (FUN_01b6f150) - TRACED
+```
+
+### Lower Priority
+
+4. **Table ID Resolution**: Map remaining table IDs (0x5E, 0x5B, etc.) to type hashes via Ghidra analysis
+5. **Prefix Semantics**: Determine exact meaning of PREFIX_1C04, PREFIX_173C, etc.
+6. **Preamble Structure**: Decode the preamble format for object initialization
+7. **Value Encoding**: Understand the full protobuf-like wire format being used
+8. **Cross-Block References**: Investigate how Blocks 3/5 relate to Blocks 2/4
 
 ## File Locations
 

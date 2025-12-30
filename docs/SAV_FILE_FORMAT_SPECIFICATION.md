@@ -801,6 +801,19 @@ The checksum is calculated on the **uncompressed** data and stored in the block 
 
 The same LZSS compressor is used for **both OPTIONS and SAV files**. Confirmed via WinDbg TTD tracing.
 
+### Address Mapping
+
+**CRITICAL:** WinDbg runtime addresses must be converted to Ghidra static addresses:
+
+| Base | Description | Value |
+|------|-------------|-------|
+| WinDbg runtime | Module base (varies with ASLR) | Example: `0x00F30000` |
+| Ghidra static | Default analysis base | `0x00400000` |
+
+**Conversion formula:** `Ghidra VA = 0x400000 + WinDbg offset`
+
+**Example:** WinDbg `ACBSP+0x1711ab0` = Ghidra `0x01B11AB0`
+
 ### Function Offsets (from ACBSP module base)
 
 | Offset | Ghidra Address | Purpose |
@@ -841,40 +854,211 @@ The main SAV block parsing function at Ghidra VA `0x0046d430`:
 
 Block objects are 0x488 bytes each.
 
-### Block Format Deserializers (8-byte Inner Headers)
+### SAV Decompressed Block Content Format
 
-After LZSS decompression (for compressed blocks), the decompressed data has an 8-byte inner header that identifies the format:
+**Important:** SAV blocks do NOT have 8-byte magic headers inside the decompressed data. The magic values (`0x00CAFE00`, `0x11FACE11`, `0x21EFFE22`) appear in the **outer 44-byte block headers**, not as inner format markers after decompression.
 
-| Format | Type (offset 0) | Magic (offset 4) | Ghidra VA | Used By |
-|--------|-----------------|------------------|-----------|---------|
-| **CAFE00** | 0x00000001 | 0x00CAFE00 | 0x01711ab0 | Block 2, Block 4 |
-| **11FACE11** | 0x00000003 | 0x11FACE11 | 0x01712db0 | OPTIONS Section 2 |
-| **21EFFE22** | 0x00000000 | 0x21EFFE22 | 0x017109e0 | OPTIONS Section 3 |
-| **Raw** | N/A | None | 0x01712660 | Block 3, Block 5 |
+#### Full Format Blocks (1, 2, 4 - LZSS Compressed)
 
-**Cross-reference with OPTIONS file:**
-- OPTIONS Section 2 uses the same 11FACE11 magic (Field3 in 44-byte header)
-- OPTIONS Section 3 uses the same 21EFFE22 magic (Field3 in 44-byte header)
-- These magics identify the serialization format after the outer LZSS layer
+After LZSS decompression, the block content starts with:
 
-**Deserializer Common Pattern:**
+| Offset | Size | Description |
+|--------|------|-------------|
+| 0x00 | 10 bytes | Null padding (`00 00 00 00 00 00 00 00 00 00`) |
+| 0x0A | 4 bytes | Type hash (little-endian) |
+| 0x0E | varies | Serialized object data |
 
-All format handlers follow the same pattern:
-1. Validate 8-byte header (type field + magic field)
-2. Skip header, setup inner deserializer via `FUN_00425360`
-3. Create object via `FUN_01afd600`
-4. Call vtable[3] on created object to deserialize contents
-5. Cleanup
+**Block Type Hashes:**
 
-### CAFE00 Handler (Block 2 Serializer)
+| Block | Type Hash | Type Name |
+|-------|-----------|-----------|
+| 1 | `0xBDBE3B52` | SaveGame |
+| 2 | `0x94D6F8F1` | AssassinSaveGameData |
+| 4 | `0xA1A85298` | PhysicalInventoryItem (first of 364) |
 
-| Address | Purpose |
-|---------|---------|
-| 0x01711C60 | Destructor wrapper |
-| 0x01711320 | Deserializer (reads properties with hashes) |
-| 0x017116D0 | Clone (copies 0x488 byte object) |
-| 0x017119A0 | CAFE00 Writer (writes magic marker) |
-| 0x01711AB0 | CAFE00 Reader (validates and decompresses) |
+#### Compact Format Blocks (3, 5 - Uncompressed)
+
+These blocks are NOT LZSS compressed. Their content starts with:
+
+| Offset | Size | Description |
+|--------|------|-------------|
+| 0x00 | 1 byte | Version prefix (`0x01`) |
+| 0x01 | 3 bytes | Size field (24-bit little-endian) |
+| 0x04 | 4 bytes | Flags (`0x00800000`) |
+| 0x08 | varies | Nibble-encoded table IDs and property data |
+
+### OPTIONS Section Magic Values (NOT for SAV Blocks)
+
+The magic values `0x11FACE11` and `0x21EFFE22` are **OPTIONS file specific**:
+
+| Magic | Used In | Location |
+|-------|---------|----------|
+| `0x11FACE11` | OPTIONS Section 2 | Field3 (offset 0x08) in 44-byte header |
+| `0x21EFFE22` | OPTIONS Section 3 | Field3 (offset 0x08) in 44-byte header |
+
+These identify OPTIONS section types, not SAV block content formats.
+
+### SAV Block Header Field3 Values
+
+Only Blocks 1 and 2 have 44-byte headers with Field3 values. Blocks 3, 4, and 5 do NOT have 44-byte headers.
+
+| Block | File Offset | Field3 Value | Notes |
+|-------|-------------|--------------|-------|
+| 1 | 0x0008 | `0x000000CD` | SaveGame root - small-value format (similar to OPTIONS Section 1's `0xC5`) |
+| 2 | 0x00E1 | `0x00CAFE00` | Game state - themed marker (CAFE00 deserializer at `FUN_01B11AB0`) |
+| 3 | N/A | No header | Raw compact format - no 44-byte header |
+| 4 | N/A | No header | LZSS data only - no 44-byte header |
+| 5 | N/A | No header | Raw compact format - no 44-byte header |
+
+**Field3 Value Patterns:**
+- Small values (`0xC5`, `0xCD`) are used for "simple" sections/blocks (OPTIONS Section 1, SAV Block 1)
+- Themed markers (`0x00CAFE00`, `0x11FACE11`, `0x21EFFE22`) are used for data sections
+
+This is in the **outer** block header structure, not the decompressed content.
+
+### Block Deserializer Functions
+
+| Ghidra VA | Purpose |
+|-----------|---------|
+| `0x01B11AB0` | **CAFE00 Deserializer** - validates type==1 && magic==0x00CAFE00, skips 8-byte header |
+| `0x01712660` | Raw/compact format reader (Blocks 3, 5) |
+| `0x01711320` | Property deserializer (reads type hashes and data) |
+| `0x01AFD600` | **Main deserializer orchestrator** - called by CAFE00 deserializer |
+| `0x01B0A740` | Object extraction/deserialization |
+| `0x01B08CE0` | **ObjectInfo metadata parser** - extracts SerializerVersion, ClassVersion, ObjectName, etc. |
+| `0x01B6F730` | Creates stream reader object (0x38 bytes) |
+| `0x01B49250` | Creates parser object (0x1058 bytes, vtable at 0x02555C60) |
+| `0x01AEDD90` | Pushes parser state onto stack (0x12d8 bytes) |
+| `0x01B7A1D0` | OPTIONS magic detector (0x57FBAA33, 0x1004FA99) |
+| `0x01B7B190` | Decompresses OPTIONS-style headers (32KB chunks) |
+
+**Note:** `0x00425360` is a buffer descriptor setter, NOT a parser. Avoid confusing it with deserializers.
+
+### Stream Reader Architecture (December 2024)
+
+The deserialization system uses a layered stream reader architecture:
+
+#### Stream Reader Object (0x38 bytes)
+
+**Factory:** `FUN_01B6F730` - Allocates and initializes stream reader
+**Constructor:** `FUN_01B6F590` - Sets vtable at `0x02556168`
+
+| Offset | Size | Purpose |
+|--------|------|---------|
+| +0x00 | 4 | Vtable pointer (0x02556168) |
+| +0x04 | 4 | Flags |
+| +0x08 | 4 | Unknown |
+| +0x0C | 4 | Unknown |
+| +0x10 | 4 | Unknown |
+| +0x14 | 4 | Buffer base pointer |
+| +0x18 | 4 | Current read position |
+| +0x1C | 4 | Buffer size/limit |
+| +0x30 | 4 | Mode flag |
+| +0x34 | 1 | Additional flags |
+
+#### Stream Reader Vtable (0x02556168)
+
+Key methods for reading/writing:
+
+| Offset | Slot | Function | Purpose |
+|--------|------|----------|---------|
+| 0x24 | 9 | `0x01B6F150` | **Read single byte** - `*dest = *stream++` |
+| 0x3C | 15 | `0x01B6F370` | **Write single byte** - `*stream++ = byte` |
+
+**FUN_01B6F150** (byte reader):
+```c
+*param_2 = **(byte **)(this + 0x18);  // Read byte from current position
+*(int *)(this + 0x18) += 1;            // Advance position
+```
+
+### Parser Object Architecture
+
+**Factory:** `FUN_01B49250` - Creates 0x1058 byte parser object
+**Vtable:** `0x02555C60`
+
+#### Parser Vtable (0x02555C60) - Extended
+
+| Offset | Slot | Function | Purpose |
+|--------|------|----------|---------|
+| 0x00 | 0 | `0x01B49B10` | Constructor/base |
+| 0x08 | 2 | `0x01B48770` | BeginElement |
+| 0x10 | 4 | `0x01B487A0` | EndElement |
+| 0x50 | 20 | `0x01B48FB0` | Read type hash ("T") |
+| 0x54 | 21 | `0x01B48E90` | Read ObjectName |
+| 0x84 | 33 | `0x01B48C10` | Read ClassID |
+| 0x8C | 35 | `0x01B48C00` | Read Version |
+| 0x98 | 38 | `0x01B48B70` | **Read PackedInfo** → dispatches to stream reader |
+| 0x9C | 39 | `0x01B48E70` | Read ObjectID |
+
+**FUN_01B48B70** → **FUN_01B49430** (Parser Dispatcher):
+- Routes read/write operations to underlying stream reader
+- Maintains counter state at `parser + 8 + index*8`
+- Checks mode flag at `parser + 4` to select read vs write path
+
+### TYPE_REF Dispatcher (FUN_01AF6A40)
+
+**Purpose:** Dispatches type references based on prefix byte in full format data.
+
+**Important:** This dispatcher uses **4-byte type hashes**, NOT nibble-encoded table IDs. It handles Blocks 1, 2, and 4 (full format), not Blocks 3 and 5 (compact format).
+
+```c
+prefix = read_byte();
+switch (prefix) {
+    case 0x00:  // Full object with nested deserialization
+        skip(1);
+        type_hash = read_uint32();
+        object = FUN_01aeb020(type_hash, 0);  // Lookup by hash
+        // ... recursive deserialization
+        break;
+
+    case 0x01:  // Type reference with validation
+        sub_type = read_byte();
+        type_hash = read_uint32();
+        if (validator != NULL) {
+            validator->vtable[3](type_hash);  // Validate type
+        }
+        object = FUN_01aeb020(type_hash, 0);
+        FUN_01ae64f0(type_hash, param_2, sub_type);
+        break;
+
+    default:    // >= 0x02: Simple object reference
+        skip(1);
+        type_hash = read_uint32();
+        object = FUN_01aeb020(type_hash, 0);
+        break;
+}
+```
+
+### Type Lookup System
+
+Two parallel lookup paths exist:
+
+| Function | Input | Purpose | Used By |
+|----------|-------|---------|---------|
+| `FUN_01AEAF70` | Table ID (small int) | Direct table lookup | Compact format (Blocks 3, 5) |
+| `FUN_01AEB020` | Type hash (4 bytes) | Hash-based lookup | Full format (Blocks 1, 2, 4) |
+
+Both converge on **FUN_01AEAD60** (core lookup):
+
+```
+FUN_01AEAF70 (table ID) ──┐
+                          ├──> FUN_01AEAD60 ──> FUN_01AEA0B0 (actual lookup)
+FUN_01AEB020 (type hash) ─┘
+```
+
+#### FUN_01AEB020 (Type Hash Lookup)
+
+- Wraps FUN_01AEAD60 with locking
+- Lock at `manager + 0x7C`
+- Returns null singleton if both params are 0
+
+#### FUN_01AEAD60 (Core Lookup)
+
+- Manages type descriptor table at `manager + 0x98`
+- Count at `manager + 0x9E` (masked 0x3FFF)
+- Each bucket: 12 bytes (base ptr, unknown, entry index)
+- Each entry: 16 bytes
+- Entry index calculation: `entry_addr = bucket_base + (entry_index << 4)`
 
 ### Type Descriptors in EXE
 
@@ -910,7 +1094,7 @@ The game uses a layered architecture for save file operations:
 
 1. **SaveGameManager** - High-level orchestration
 2. **SaveGame I/O Class** - File read/write/delete operations
-3. **Block Deserializers** - Type-specific content parsing (CAFE00 handler, etc.)
+3. **Block Deserializers** - Format-specific content parsing (Full Format and Compact Format handlers)
 
 #### SaveGameManager Class
 
@@ -976,16 +1160,14 @@ SaveGameManager callers (0046dea0, 0046df80, 0046f6b0)
                                             v
                                     [Raw SAV data in memory]
                                             |
-                                    FUN_0046d430 (Block Parser) <-- IDENTIFIED
+                                    FUN_0046d430 (Block Parser)
                                             |
                                     +-- vtable[10] dispatch per block:
-                                        +-- FUN_01711ab0 (CAFE00 - Blocks 2, 4)
-                                        +-- FUN_01712db0 (11FACE11)
-                                        +-- FUN_017109e0 (21EFFE22)
-                                        +-- FUN_01712660 (Raw - Blocks 3, 5)
+                                        +-- FUN_01711ab0 (Full format - Blocks 1, 2, 4)
+                                        +-- FUN_01712660 (Compact format - Blocks 3, 5)
 ```
 
-**RESOLVED:** The block parser function has been identified as `FUN_0046d430`. See "Block Parser Function" section below for details.
+**Note:** The SAV block deserializers read the 10-byte null padding + type hash format (full format) or the compact format with version prefix. The 11FACE11 and 21EFFE22 handlers are used for OPTIONS file sections, not SAV blocks.
 
 #### Serialization Framework (TLS-based)
 

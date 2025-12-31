@@ -13,11 +13,13 @@ File Structure:
 | 1 Data| 0x002C     | variable  | LZSS → 283 bytes            |
 | 2 Hdr | 0x00D9     | 44 bytes  | Standard header (0x00CAFE00)|
 | 2 Data| 0x0105     | variable  | LZSS → 32KB                 |
-| 3     | dynamic    | 7,972 b   | Uncompressed                |
-| 4     | dynamic    | variable  | LZSS (no header) → 32KB     |
-| 5     | end-6266   | 6,266 b   | Uncompressed                |
+| 3     | dynamic    | variable  | Uncompressed (4 nested regions)  |
+| 4     | dynamic    | variable  | LZSS (no header) → ~32KB    |
+| 5     | dynamic    | variable  | Uncompressed (2 nested regions)  |
 
-Block offsets for 3/4/5 are calculated dynamically based on compressed sizes.
+Block 3 contains 4 nested regions with headers (01 XX XX XX 00 00 80 00).
+Region 4's declared size = Block 4's compressed size (cross-block reference).
+Block 5 starts immediately after Block 4 and extends to end of file.
 
 Header Structure (44 bytes, 11 x 4-byte fields):
 -----------------------------------------------
@@ -420,7 +422,9 @@ def parse_savegame(filepath: str, output_dir: str = None, scan_types: bool = Fal
     print("BLOCK 2 (Game State)")
     print("-" * 80)
 
-    block2_header_offset = 0x00D9
+    # Calculate Block 2 header offset dynamically based on Block 1 size
+    # Block 2 header immediately follows Block 1 compressed data
+    block2_header_offset = block1_data_offset + block1_header.compressed_size
     block2_header_data = data[block2_header_offset:block2_header_offset + 44]
     block2_header = SavHeader(block2_header_data, block2_header_offset)
 
@@ -437,7 +441,8 @@ def parse_savegame(filepath: str, output_dir: str = None, scan_types: bool = Fal
     print(f"  Checksum:         0x{block2_header.checksum:08X}")
 
     # Extract and decompress block 2 data
-    block2_data_offset = 0x0105
+    # Block 2 data immediately follows Block 2 header (44 bytes after header start)
+    block2_data_offset = block2_header_offset + 44
     block2_compressed = data[block2_data_offset:block2_data_offset + block2_header.compressed_size]
 
     print(f"\nCompressed data at: 0x{block2_data_offset:04X}")
@@ -489,7 +494,37 @@ def parse_savegame(filepath: str, output_dir: str = None, scan_types: bool = Fal
 
     # Calculate offset dynamically from Block 2
     block3_offset = block2_data_offset + block2_header.compressed_size
-    block3_size = 7972
+
+    # Parse Block 3's nested headers to find Region 4 which declares Block 4's size
+    # Block 3 has 4 nested headers with pattern: 01 XX XX XX 00 00 80 00
+    block3_regions = []
+    search_pos = block3_offset
+    for region_num in range(4):
+        # Find next header with pattern: version=0x01, size (3 bytes), 00 00 80 00
+        while search_pos < total_size - 8:
+            if (data[search_pos] == 0x01 and
+                data[search_pos+4:search_pos+8] == b'\x00\x00\x80\x00'):
+                region_size = struct.unpack('<I', data[search_pos+1:search_pos+4] + b'\x00')[0]
+                if 0 < region_size < 50000:  # Sanity check
+                    block3_regions.append((search_pos, region_size))
+                    # Move past this header + data + 5-byte gap
+                    search_pos = search_pos + 8 + region_size + 5
+                    break
+            search_pos += 1
+
+    # Region 4's declared size equals Block 4's compressed size (cross-block reference)
+    if len(block3_regions) >= 4:
+        region4_offset, block4_compressed_size = block3_regions[3]
+        # Block 3 ends after Region 4 header (8 bytes) + Region 4 data (5 bytes)
+        # Region 4 only has 5 bytes of local data, not the declared size
+        block3_end = region4_offset + 8 + 5  # header + 5-byte local data
+        block3_size = block3_end - block3_offset
+    else:
+        # Fallback to old hardcoded value if header parsing fails
+        print("WARNING: Could not parse Block 3 headers, using fallback size")
+        block3_size = 7972
+        block4_compressed_size = None
+
     block3_data = data[block3_offset:block3_offset + block3_size]
 
     print(f"Offset: 0x{block3_offset:04X}")
@@ -518,23 +553,39 @@ def parse_savegame(filepath: str, output_dir: str = None, scan_types: bool = Fal
     }
 
     # =========================================================================
-    # BLOCK 5: Uncompressed data (always last 6266 bytes)
-    # NOTE: We calculate Block 5 first to determine Block 4's size
-    # =========================================================================
-    block5_size = 6266
-    block5_offset = total_size - block5_size
-
-    # =========================================================================
     # BLOCK 4: LZSS compressed (no header) - between Block 3 and Block 5
+    # Block 4 size is declared in Block 3 Region 4's header
     # =========================================================================
     print("\n" + "=" * 80)
     print("BLOCK 4 (LZSS - No Header)")
     print("-" * 80)
 
-    # Calculate offset and size dynamically
+    # Block 4 starts immediately after Block 3
     block4_offset = block3_offset + block3_size
-    block4_size = block5_offset - block4_offset
+
+    # Use the size from Block 3 Region 4 if available
+    if block4_compressed_size is not None:
+        block4_size = block4_compressed_size
+    else:
+        # Fallback: search for Block 5 header to determine Block 4 end
+        block5_offset = None
+        for i in range(block4_offset + 100, total_size - 8):
+            if (data[i] == 0x01 and
+                data[i+4:i+8] == b'\x00\x00\x80\x00'):
+                region_size = struct.unpack('<I', data[i+1:i+4] + b'\x00')[0]
+                if 0 < region_size < 10000:
+                    block5_offset = i
+                    break
+        if block5_offset is None:
+            # Last resort fallback
+            block5_offset = total_size - 6266
+        block4_size = block5_offset - block4_offset
+
     block4_compressed = data[block4_offset:block4_offset + block4_size]
+
+    # Calculate Block 5 offset (immediately after Block 4)
+    block5_offset = block4_offset + block4_size
+    block5_size = total_size - block5_offset
 
     print(f"Compressed data at: 0x{block4_offset:04X}")
     print(f"Compressed size:    {len(block4_compressed)} bytes")
@@ -568,13 +619,14 @@ def parse_savegame(filepath: str, output_dir: str = None, scan_types: bool = Fal
     }
 
     # =========================================================================
-    # BLOCK 5: Uncompressed data (offset/size calculated above)
+    # BLOCK 5: Uncompressed data (immediately follows Block 4)
+    # Size is variable - calculated as remaining bytes after Block 4
     # =========================================================================
     print("\n" + "=" * 80)
     print("BLOCK 5 (Uncompressed)")
     print("-" * 80)
 
-    # block5_offset and block5_size already calculated before Block 4
+    # block5_offset and block5_size already calculated after Block 4
     block5_data = data[block5_offset:block5_offset + block5_size]
 
     print(f"Offset: 0x{block5_offset:04X}")
@@ -638,9 +690,9 @@ def main():
 Output files:
   sav_block1_decompressed.bin - Block 1 (283 bytes - player profile)
   sav_block2_decompressed.bin - Block 2 (32KB - game state)
-  sav_block3_raw.bin          - Block 3 (7,972 bytes - uncompressed, compact format)
-  sav_block4_decompressed.bin - Block 4 (32KB - game state)
-  sav_block5_raw.bin          - Block 5 (6,266 bytes - uncompressed, compact format)
+  sav_block3_raw.bin          - Block 3 (variable - uncompressed, compact format)
+  sav_block4_decompressed.bin - Block 4 (~32KB - inventory items)
+  sav_block5_raw.bin          - Block 5 (variable - uncompressed, compact format)
 
 Examples:
   python sav_parser.py ACBROTHERHOODSAVEGAME0.SAV

@@ -201,6 +201,55 @@ Example:
 
 SAV files do not have a dedicated footer. Block 5 ends at the file's end.
 
+### 2.4 Region Structure (Blocks 3-5)
+
+**Discovery:** Blocks 3 and 5 (and the relationship with Block 4) use a **Region** structure with checksums.
+
+#### Region Format
+
+Each region within Blocks 3 and 5 has:
+
+```
+Offset | Size | Field           | Description
+-------|------|-----------------|----------------------------------
+0x00   | 1    | Version         | Always 0x01
+0x01   | 3    | Size            | 24-bit LE data size
+0x04   | 4    | Flags           | Always 0x00008000
+0x08   | 1    | Prefix          | Always 0x00
+0x09   | 4    | Checksum        | Zero-seed Adler32 of data
+0x0D   | N    | Data            | Region data (N = Size - 5)
+```
+
+#### Block 3 Region Layout
+
+Block 3 contains **4 regions**:
+
+| Region | Purpose | Typical Size |
+|--------|---------|--------------|
+| 1 | World data | ~3,670 bytes |
+| 2 | Additional data | ~2,300 bytes |
+| 3 | Additional data | ~2,300 bytes |
+| 4 | **Block 4 reference** | 5 bytes local + size declaration |
+
+**Critical:** Region 4's **declared size** equals Block 4's **compressed LZSS size**. The checksum in Region 4's prefix is the Adler32 of Block 4's LZSS data.
+
+#### Cross-Block Reference (Region 4 → Block 4)
+
+```
+Block 3 Region 4:
+  [01] [size 3B] [00 00 80 00] [00] [checksum 4B] [5 bytes local data]
+       ↑                             ↑
+       Block 4 LZSS size             Adler32 of Block 4 LZSS data
+
+Block 4:
+  [LZSS compressed data - size declared in Region 4]
+```
+
+When modifying Block 4:
+1. Recompress Block 4 data
+2. Update Region 4's size field (bytes 1-3) with new compressed size
+3. Update Region 4's checksum (bytes 9-12) with Adler32 of new LZSS data
+
 ---
 
 ## 3. LZSS Compression Layer
